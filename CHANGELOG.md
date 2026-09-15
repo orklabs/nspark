@@ -10,6 +10,113 @@ will be reflected here.
 
 ## [Unreleased]
 
+## [0.2.0-alpha.4] - 2026-09-15
+
+Ports the Swift SDK 0.2.0 / 0.2.1 hardening (September 2026), re-verifies each flow
+against the reference TypeScript SDK (`buildonspark/spark`, August 2026), and was
+exercised end to end on mainnet with the integration wallets: Lightning send and
+receive, Spark transfers and claims, leaf renewal and consolidation, and a
+cooperative exit that confirmed on-chain.
+
+### Security
+- `WithdrawAsync` verifies the SSP's cooperative-exit response before signing: the
+  raw exit transaction must hash to the reported txid, pay the destination at least
+  `amount - fee`, and the connector transaction must spend it and carry one output
+  per leaf. A response that fails throws `SparkUntrustedResponseException` and no
+  leaf is handed over. Fees are bounded by a new optional `maxFeeSats` (default: the
+  SSP's own quote); a quote above the cap throws `FeeExceedsLimitException`. Mirrors
+  the reference SDK's `validateCoopExitPayoutTransaction` and
+  `validateConnectorTxBindsToCoopExitTxid`.
+- `PayLightningInvoiceAsync` requires `maxFeeSats` and refuses a higher SSP
+  estimate before any leaf is touched. Invoices are decoded by a BOLT-11 parser that
+  verifies the bech32 checksum, enforces the wallet's network, rounds sub-sat
+  amounts up, and rejects hostile amounts. A caller amount is only accepted for
+  amountless invoices.
+- `CreateLightningInvoiceAsync` verifies the SSP-returned invoice (payment hash,
+  amount, network) before any preimage share is stored with the operators.
+- Inbound claims verify the sender's signature on every leaf, over
+  `sha256(leafId || transferId || secretCipher)` with the sender's identity key,
+  before any secret is decrypted or refund signed (reference SDK:
+  `verifyPendingTransfer`). Both the legacy bare-bytes form (compact or DER ECDSA)
+  and the scheme-tagged `common.Signature` (strict-DER ECDSA, BIP-340 Schnorr) are
+  accepted; the transfer proto now carries the typed field. A transfer that fails
+  verification is skipped by `ClaimPendingTransfersAsync`.
+- Token commits verify the coordinator's final transaction against the submitted
+  partial transaction (inputs, outputs, owners, amounts, operator keys, version,
+  timestamp, withdraw bond, relative locktime, keyshare threshold and owners)
+  before signing it for each operator (reference SDK: `validateTokenTransaction`).
+  New options: `SparkOptions.SigningThreshold`, `ExpectedWithdrawBondSats` (10 000),
+  `ExpectedWithdrawRelativeBlockLocktime` (1 000).
+
+### Fixed
+- **Withdrawals were rejected by mainnet.** `WithdrawAsync` used the older two-step
+  cooperative exit (unsigned refund jobs in `cooperative_exit_v2`, then
+  `finalize_transfer_with_transfer_package`), which the coordinator now refuses with
+  "transfer_package is required for cooperative exit". The connector-input refund
+  transactions are FROST-signed by the user and sent together with the encrypted
+  key-tweak package in a single `cooperative_exit_v2` call, with a 7-day expiry on
+  mainnet, exactly as the reference SDK's `CoopExitService` does. Verified on mainnet
+  with a real withdrawal to the wallet's static deposit address.
+- One leaf at the timelock floor no longer fails a send, Lightning payment, swap, or
+  withdrawal that other leaves could cover. Every spend path now selects from
+  `GetSpendableLeavesAsync()`: leaves in the coordinator's renewable range
+  `[100, 200)` are renewed first (best effort, like the reference leaf manager) and
+  leaves at the floor are left out.
+- `SatsBalance.Available` now means "can be sent right now": `AVAILABLE` leaves at
+  the timelock floor are reported in the new `SatsBalance.Frozen` instead, so
+  sending the full available balance always succeeds.
+- A Lightning send whose SSP call fails after the coordinator locked the leaves now
+  throws `SparkLightningSendIncompleteException` carrying the transfer id and
+  payment hash instead of a bare error with no way to reconcile. Pass the id back
+  as `transferId` to resume; it is also sent as the coordinator idempotency key
+  (`x-idempotency-key`), as the reference SDK does.
+- The FROST signing threshold is taken from the configuration
+  (`SparkOptions.EffectiveSigningThreshold`) in every flow instead of being derived
+  from whatever operator count the coordinator reports.
+- `ClaimPendingTransfersAsync` no longer swallows cancellation.
+- `SparkLeaf.RefundTimelockBlocks` reads as 0 for an unparseable refund
+  transaction instead of throwing from a property getter.
+
+### Added
+- `GetSpendableLeavesAsync()`, `SparkLeaf.IsSpendable`, `SparkLeaf.IsRenewable`,
+  `SatsBalance.Frozen`, `SatsBalance.Locked`.
+- `PayLightningInvoiceAsync(..., amountSats:)` for amountless invoices and
+  `transferId:` to resume an incomplete send.
+- `WithdrawAsync(..., maxFeeSats:)`.
+- `SparkOptions.SigningThreshold`, `EffectiveSigningThreshold`,
+  `DefaultSigningThreshold`, `ExpectedWithdrawBondSats`,
+  `ExpectedWithdrawRelativeBlockLocktime`.
+- Exceptions: `FeeExceedsLimitException`, `SparkUntrustedResponseException`,
+  `SparkLightningSendIncompleteException`.
+- `common.Signature` / `SignatureScheme` and `TransferLeaf.typed_signature` in the
+  protos, matching the current reference protos.
+- Integration tests: `WithdrawalTests.CoopExitResponseFromTheSspValidatesWithoutSigning`
+  requests a real cooperative exit from the SSP and runs the validator and connector-refund
+  construction on it without signing (nothing moves); `ShouldWithdrawToOnChainAddress` is
+  now opt-in (`NSPARK_TEST_ALLOW_WITHDRAW=1`) and pays the wallet's own static deposit
+  address by default so the sats can be claimed back.
+
+### Changed
+- **Breaking:** `PayLightningInvoiceAsync` takes a required `maxFeeSats` (it was
+  optional and unbounded by default) and gained `amountSats` and `transferId`
+  before `ct`.
+- **Breaking:** `WithdrawAsync` gained an optional `maxFeeSats` before `ct`; callers
+  passing the cancellation token positionally must use `ct:`.
+- `WithdrawAsync` returns the exit txid computed from the verified transaction, in
+  display (big-endian hex) order.
+- `PayLightningInvoiceAsync` no longer populates the legacy `transfer` field of
+  `initiate_preimage_swap_v3` nor `leaves_to_send` on the transfer request: the
+  reference SDK sends neither, and the coordinator reads everything from the
+  transfer package. One signing-commitment round trip and one FROST round per leaf
+  fewer.
+- `PayLightningAddressAsync` requires `maxFeeSats` for the same reason.
+- `RenewExhaustedLeavesAsync` still sweeps every leaf below 200; the automatic
+  renewal before a spend only attempts the `[100, 200)` range.
+- The internal BOLT-11 decoder (`LightningService.Bolt11Decoder`) is replaced by
+  `Bolt11Invoice`; `Bech32mHelper` learned to decode plain bech32.
+- `Microsoft.SourceLink.GitHub` bumped off 8.0.0, whose `Microsoft.Build.Tasks.Git`
+  dependency carries advisory CVE-2026-62900 and failed every Release build as NU1902.
+
 ## [0.2.0-alpha.3] - 2026-07-15
 
 ### Added
