@@ -3,14 +3,26 @@ using NSpark.Exceptions;
 
 namespace NSpark.Services;
 
+/// <summary>Which checksum constant a bech32-family string was encoded with.</summary>
+internal enum Bech32Variant
+{
+    /// <summary>BIP-173 bech32 (constant 1): segwit v0 addresses, BOLT-11 invoices.</summary>
+    Bech32,
+
+    /// <summary>BIP-350 bech32m (constant 0x2bc830a3): segwit v1+ addresses, Spark addresses, token ids.</summary>
+    Bech32m,
+}
+
 /// <summary>
 /// Bech32m encoder / decoder used by Spark addresses, Bitcoin segwit
 /// addresses, and Spark token identifiers. Implements BIP-350 with arbitrary
-/// human-readable parts.
+/// human-readable parts. <see cref="DecodeWords(string)"/> additionally accepts plain
+/// BIP-173 bech32, which BOLT-11 invoices use.
 /// </summary>
 public static class Bech32mHelper
 {
     private const string Charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    private const uint Bech32Const = 1;
     private const uint Bech32mConst = 0x2bc830a3;
 
     private static readonly int[] CharsetLookup = BuildCharsetLookup();
@@ -25,20 +37,7 @@ public static class Bech32mHelper
 
         var words = ConvertBits(data, fromBits: 8, toBits: 5, pad: true)
             ?? throw new SparkConfigurationException("bech32m.encode", "Failed to convert bytes to 5-bit words.");
-        var checksum = CreateChecksum(hrp, words);
-
-        var sb = new StringBuilder(hrp.Length + 1 + words.Length + 6);
-        sb.Append(hrp);
-        sb.Append('1');
-        foreach (var w in words)
-        {
-            sb.Append(Charset[w]);
-        }
-        foreach (var c in checksum)
-        {
-            sb.Append(Charset[c]);
-        }
-        return sb.ToString();
+        return EncodeWords(hrp, words, Bech32Variant.Bech32m);
     }
 
     /// <summary>
@@ -56,7 +55,18 @@ public static class Bech32mHelper
         words[0] = witnessVersion;
         programWords.CopyTo(words.AsSpan(1));
 
-        var checksum = CreateChecksum(hrp, words);
+        return EncodeWords(hrp, words, Bech32Variant.Bech32m);
+    }
+
+    /// <summary>
+    /// Encode raw 5-bit words (no checksum) under the given HRP with the checksum of
+    /// <paramref name="variant"/>. The inverse of <see cref="DecodeWords(string)"/>.
+    /// </summary>
+    internal static string EncodeWords(string hrp, ReadOnlySpan<byte> words, Bech32Variant variant)
+    {
+        ArgumentNullException.ThrowIfNull(hrp);
+
+        var checksum = CreateChecksum(hrp, words, variant == Bech32Variant.Bech32m ? Bech32mConst : Bech32Const);
 
         var sb = new StringBuilder(hrp.Length + 1 + words.Length + 6);
         sb.Append(hrp);
@@ -92,22 +102,58 @@ public static class Bech32mHelper
                 $"Bech32m string is {bech32m.Length} chars, max is {limit}.");
         }
 
-        var lower = bech32m.ToLowerInvariant();
+        var (hrp, words, variant) = DecodeWords(bech32m, "bech32m.decode");
+        if (variant != Bech32Variant.Bech32m)
+        {
+            throw new SparkConfigurationException("bech32m.decode", "Invalid bech32m checksum.");
+        }
+
+        // Convert the 5-bit payload words back to bytes.
+        var bytes = ConvertBits(words, fromBits: 5, toBits: 8, pad: false)
+            ?? throw new SparkConfigurationException("bech32m.decode", "Bech32m payload contains illegal padding.");
+
+        return (hrp, bytes);
+    }
+
+    /// <summary>
+    /// Decode a bech32 (BIP-173) or bech32m (BIP-350) string into its HRP and the raw 5-bit
+    /// data words with the six checksum words stripped, reporting which checksum matched.
+    /// There is no length limit — BOLT-11 invoices routinely exceed 90 characters — and the
+    /// words are returned unconverted because BOLT-11 tagged fields are laid out in 5-bit words.
+    /// Mixed-case input is rejected, as BIP-173 requires.
+    /// </summary>
+    internal static (string Hrp, byte[] Words, Bech32Variant Variant) DecodeWords(string encoded)
+        => DecodeWords(encoded, "bech32.decode");
+
+    private static (string Hrp, byte[] Words, Bech32Variant Variant) DecodeWords(string encoded, string operation)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(encoded);
+
+        var hasLower = false;
+        var hasUpper = false;
+        foreach (var c in encoded)
+        {
+            if (c < 33 || c > 126)
+            {
+                throw new SparkConfigurationException(operation, $"Invalid character (code {(int)c}) in bech32 string.");
+            }
+            hasLower |= char.IsLower(c);
+            hasUpper |= char.IsUpper(c);
+        }
+        if (hasLower && hasUpper)
+        {
+            throw new SparkConfigurationException(operation, "Bech32 strings must not mix upper and lower case.");
+        }
+
+        var lower = encoded.ToLowerInvariant();
         var sepIdx = lower.LastIndexOf('1');
         if (sepIdx < 1 || sepIdx + 7 > lower.Length)
         {
-            throw new SparkConfigurationException(
-                "bech32m.decode",
-                "Bech32m string missing or misplaced '1' separator.");
+            throw new SparkConfigurationException(operation, "Bech32 string missing or misplaced '1' separator.");
         }
 
         var hrp = lower[..sepIdx];
         var dataStr = lower[(sepIdx + 1)..];
-
-        if (dataStr.Length < 6)
-        {
-            throw new SparkConfigurationException("bech32m.decode", "Bech32m data section is shorter than 6 chars.");
-        }
 
         var words = new byte[dataStr.Length];
         for (int i = 0; i < dataStr.Length; i++)
@@ -116,23 +162,25 @@ public static class Bech32mHelper
             if (idx < 0)
             {
                 throw new SparkConfigurationException(
-                    "bech32m.decode",
-                    $"Invalid bech32m character '{dataStr[i]}' at position {sepIdx + 1 + i}.");
+                    operation,
+                    $"Invalid bech32 character '{dataStr[i]}' at position {sepIdx + 1 + i}.");
             }
             words[i] = (byte)idx;
         }
 
-        if (!VerifyChecksum(hrp, words))
+        var hrpExpanded = HrpExpand(hrp);
+        var values = new byte[hrpExpanded.Length + words.Length];
+        Array.Copy(hrpExpanded, 0, values, 0, hrpExpanded.Length);
+        Array.Copy(words, 0, values, hrpExpanded.Length, words.Length);
+        var variant = Polymod(values) switch
         {
-            throw new SparkConfigurationException("bech32m.decode", "Invalid bech32m checksum.");
-        }
+            Bech32Const => Bech32Variant.Bech32,
+            Bech32mConst => Bech32Variant.Bech32m,
+            _ => throw new SparkConfigurationException(operation, "Invalid bech32 checksum."),
+        };
 
-        // Strip the 6-word checksum suffix, convert remaining 5-bit words back to bytes.
-        var payloadWords = words[..^6];
-        var bytes = ConvertBits(payloadWords, fromBits: 5, toBits: 8, pad: false)
-            ?? throw new SparkConfigurationException("bech32m.decode", "Bech32m payload contains illegal padding.");
-
-        return (hrp, bytes);
+        // Strip the 6-word checksum suffix.
+        return (hrp, words[..^6], variant);
     }
 
     /// <summary>
@@ -171,29 +219,20 @@ public static class Bech32mHelper
         return result.ToArray();
     }
 
-    private static byte[] CreateChecksum(string hrp, byte[] data)
+    private static byte[] CreateChecksum(string hrp, ReadOnlySpan<byte> data, uint constant)
     {
         var hrpExpanded = HrpExpand(hrp);
         var values = new byte[hrpExpanded.Length + data.Length + 6];
         Array.Copy(hrpExpanded, 0, values, 0, hrpExpanded.Length);
-        Array.Copy(data, 0, values, hrpExpanded.Length, data.Length);
+        data.CopyTo(values.AsSpan(hrpExpanded.Length));
 
-        var polymod = Polymod(values) ^ Bech32mConst;
+        var polymod = Polymod(values) ^ constant;
         var checksum = new byte[6];
         for (int i = 0; i < 6; i++)
         {
             checksum[i] = (byte)((polymod >> (5 * (5 - i))) & 0x1F);
         }
         return checksum;
-    }
-
-    private static bool VerifyChecksum(string hrp, byte[] data)
-    {
-        var hrpExpanded = HrpExpand(hrp);
-        var values = new byte[hrpExpanded.Length + data.Length];
-        Array.Copy(hrpExpanded, 0, values, 0, hrpExpanded.Length);
-        Array.Copy(data, 0, values, hrpExpanded.Length, data.Length);
-        return Polymod(values) == Bech32mConst;
     }
 
     private static byte[] HrpExpand(string hrp)

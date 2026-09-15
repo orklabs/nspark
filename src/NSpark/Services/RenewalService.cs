@@ -21,7 +21,7 @@ public static class RenewalService
     /// 100 after the next transfer, which would freeze the leaf and interfere
     /// with watchtowers (matches JS doesTxnNeedRenewed).
     /// </summary>
-    private const uint RenewalThreshold = 200;
+    internal const uint RenewalThreshold = 200;
 
     /// <summary>
     /// Renew every leaf whose refund timelock has run low (&lt; 200 blocks).
@@ -46,9 +46,29 @@ public static class RenewalService
 
         var leaves = await wallet.GetLeavesAsync(ct).ConfigureAwait(false);
         var needing = leaves.Where(l => l.RefundTimelockBlocks < RenewalThreshold).ToList();
+        return await RenewLeavesAsync(wallet, needing, leaves.Count, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Renew exactly the given leaves (the spend paths pass the ones in the coordinator's
+    /// renewable range, <see cref="SparkLeaf.IsRenewable"/>). Per-leaf and best-effort like
+    /// <see cref="RenewExhaustedLeavesAsync"/>.
+    /// </summary>
+    internal static Task<SparkLeafRenewal> RenewLeavesAsync(
+        this SparkWallet wallet,
+        IReadOnlyList<SparkLeaf> needing,
+        CancellationToken ct = default)
+        => RenewLeavesAsync(wallet, needing, needing.Count, ct);
+
+    private static async Task<SparkLeafRenewal> RenewLeavesAsync(
+        SparkWallet wallet,
+        IReadOnlyList<SparkLeaf> needing,
+        int checkedCount,
+        CancellationToken ct)
+    {
         if (needing.Count == 0)
         {
-            return new SparkLeafRenewal(leaves.Count, 0, Array.Empty<string>());
+            return new SparkLeafRenewal(checkedCount, 0, Array.Empty<string>());
         }
 
         var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
@@ -95,7 +115,7 @@ public static class RenewalService
             }
         }
 
-        return new SparkLeafRenewal(leaves.Count, renewed, failures);
+        return new SparkLeafRenewal(checkedCount, renewed, failures);
     }
 
     private static async Task RenewLeafAsync(

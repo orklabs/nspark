@@ -3,13 +3,30 @@
 Withdraw Spark sats back to a Bitcoin L1 address via a **cooperative
 exit** brokered by the SSP. The wallet:
 
-1. Selects leaves to cover the amount (swap if no exact match).
-2. Asks the SSP to quote a cooperative-exit transaction.
-3. Co-signs the SSP's connector transaction with FROST against the
-   Signing Operators.
-4. The SSP broadcasts the spending transaction on-chain.
+1. Validates the destination (P2PKH, P2SH, P2WPKH, P2WSH, or P2TR on the
+   wallet's network) before anything moves.
+2. Selects spendable leaves that sum to exactly the amount (swapping with
+   the SSP first if no exact combination exists).
+3. Quotes the SSP's fee for those leaves and bounds it.
+4. Asks the SSP to build the exit and connector transactions, and
+   **verifies them** before signing anything.
+5. FROST-signs the connector refund transactions with the Signing
+   Operators and hands the leaves over in one `cooperative_exit_v2` call.
+6. Tells the SSP to complete the exit; the SSP broadcasts on-chain.
 
-The returned identifier is an on-chain transaction id.
+The returned identifier is the on-chain transaction id.
+
+## Amount and fee semantics
+
+The SSP's fee is deducted from `amountSats`: the destination receives
+`amountSats` minus the fee. Leaves are swapped to denominations that sum to
+exactly `amountSats` first, so no more than the requested amount ever
+leaves the wallet.
+
+`maxFeeSats` bounds what the SSP may take. When omitted, the SSP's own fee
+quote for the selected leaves is the bound. A quote above the cap, or a cap
+that would consume the whole amount, throws `FeeExceedsLimitException`
+before any leaf is moved.
 
 ## Quote the fee first
 
@@ -17,13 +34,15 @@ The returned identifier is an on-chain transaction id.
 using NSpark;
 using NSpark.Services;
 
-var quote = await wallet.GetFeeQuoteAsync(amountSats: 10_000);
-Console.WriteLine($"Network fee: {quote.FeeSats} sats @ {quote.FeeRateSatsPerVbyte} sat/vB");
+var leaves = await wallet.SelectLeavesWithSwapAsync(10_000);
+var quote = await wallet.GetFeeQuoteAsync(
+    leaves.Select(l => l.Id).ToArray(),
+    "bc1q...");
+Console.WriteLine($"Fee: {quote.FeeSats} sats");
 ```
 
-The quote is informational — the actual fee is computed by the SSP at
-withdraw time. Use it to show the user the expected cost before
-confirming.
+`WithdrawAsync` fetches the same quote internally and uses it as the fee
+bound unless you pass `maxFeeSats`. Show it to the user before confirming.
 
 ## Withdraw
 
@@ -31,53 +50,82 @@ confirming.
 var txid = await wallet.WithdrawAsync(
     onChainAddress: "bc1q...",     // user-supplied destination
     amountSats: 10_000,
+    maxFeeSats: 500,               // optional; default: the SSP's quote
     ct: cancellationToken);
 
 Console.WriteLine($"Withdrawal tx: {txid}");
 ```
 
-After this returns, the SSP has built and broadcast the spending
-transaction; the leaves that funded it are out of `AVAILABLE` state
-and will not show up on subsequent `GetBalanceAsync` calls.
+After this returns, the SSP has the signed package and broadcasts the
+spending transaction; the leaves that funded it are out of `AVAILABLE`
+state and will not show up on subsequent `GetBalanceAsync` calls.
 
 > **Destructive.** Withdrawal spends balance. There's no second
 > claim — the destination receives sats on L1 directly.
 
+## What is verified before signing
+
+The SSP's `request_coop_exit` response carries the raw exit transaction,
+the raw connector transaction, and the exit txid. Before any refund is
+signed or any key tweak is prepared, NSpark checks that:
+
+- the raw exit transaction hashes to the reported txid (either byte order
+  is accepted, as the operators do);
+- it pays the requested address at least `amountSats - feeCap`;
+- the connector transaction's first input spends that exit transaction;
+- the connector transaction carries one output per leaf plus the SSP's own.
+
+A response that fails any check throws `SparkUntrustedResponseException`
+and nothing is handed over. Without these checks the wallet would hand its
+leaves to the SSP on the SSP's word: the operators release the transfer once
+the exit txid confirms, but only the client knows what that transaction was
+supposed to pay. This mirrors the reference SDK's
+`validateCoopExitPayoutTransaction` and
+`validateConnectorTxBindsToCoopExitTxid`.
+
 ## What happens behind the scenes
 
-The withdrawal flow goes through the SSP's `RequestCoopExit` GraphQL
-mutation:
+1. The wallet picks spendable leaves that sum to the amount, swapping with
+   the SSP first if no exact-value combination exists.
+2. The SSP returns the exit transaction (paying the destination and the
+   SSP's fee) and a connector transaction that spends it, with one
+   connector output per leaf.
+3. For each leaf the wallet builds the next refund transaction trio (CPFP,
+   direct, direct-from-CPFP) with the matching connector output appended as
+   a second input, and FROST-signs each one against the Signing Operators'
+   nonce commitments.
+4. The signed refunds and the ECIES-encrypted key-tweak package that hands
+   the leaves to the SSP go to the coordinator in a single
+   `cooperative_exit_v2` call, with a 7-day expiry on mainnet.
+5. The wallet calls the SSP's `complete_coop_exit`; the SSP broadcasts the
+   exit transaction on-chain.
 
-1. The wallet picks leaves that sum to the amount, swapping with the
-   SSP first if no exact-value combination exists.
-2. The SSP returns a partially-constructed Bitcoin transaction (the
-   "connector transaction") that pays the destination + the SSP's fee.
-3. The wallet builds per-leaf refund signing jobs against the connector
-   transaction with a 7-day expiry, signs with FROST against the SOs.
-4. The wallet submits the signed package to the SSP via
-   `complete_coop_exit`.
-5. The SSP broadcasts the final spending transaction on-chain and
-   returns the txid.
+The refunds spend a connector output, so they can only confirm after the
+exit transaction does: the operators release the transfer to the SSP once
+the exit txid confirms, and the pre-signed refunds let the wallet recover
+the leaves on-chain if it never does. `GetRecoverySnapshotAsync()` captures
+everything besides the seed that a unilateral exit needs — see
+[docs/recovery.md](recovery.md).
 
-The 7-day expiry is intentional: if for some reason the SSP fails to
-broadcast or the broadcast fails, the wallet can use the pre-signed
-refund transactions to spend the leaves on-chain unilaterally after the
-expiry. `GetRecoverySnapshotAsync()` captures everything besides the
-seed that a unilateral exit needs — see
-[docs/recovery.md](recovery.md) for snapshots, leaf renewal, and
-consolidation.
+The coordinator only accepts this single-call form today. The earlier
+two-step form (unsigned refund jobs, then
+`finalize_transfer_with_transfer_package`) is rejected by mainnet with
+"transfer_package is required for cooperative exit".
 
 ## Selecting which leaves to spend
 
 `WithdrawAsync` delegates to `SelectLeavesWithSwapAsync(amount)`, which:
 
-1. Looks for an exact-amount leaf match.
-2. Falls back to a multi-leaf combination that sums to the amount.
-3. If neither exists, requests a leaf swap from the SSP (the SSP
-   exchanges your leaves for a freshly-sized leaf via two intra-Spark
-   transfers) and retries.
+1. Takes the spendable leaves (`GetSpendableLeavesAsync()`): leaves in the
+   coordinator's renewable range are renewed first, and leaves at the
+   timelock floor are left out so one stuck leaf cannot fail the exit.
+2. Looks for an exact-amount leaf match, then a multi-leaf combination that
+   sums to the amount.
+3. If neither exists, requests a leaf swap from the SSP (the SSP exchanges
+   your leaves for freshly-sized ones via two intra-Spark transfers) and
+   retries.
 
-You can pre-swap explicitly if you want to control fees:
+You can pre-swap explicitly if you want to control when the swap happens:
 
 ```csharp
 var leaves = await wallet.SelectLeavesWithSwapAsync(10_000);
@@ -85,22 +133,22 @@ var leaves = await wallet.SelectLeavesWithSwapAsync(10_000);
 var txid = await wallet.WithdrawAsync("bc1q...", 10_000);
 ```
 
+Use `balance.SatsBalance.Available` (which already excludes frozen leaves)
+as the basis for a "withdraw everything" amount.
+
 ## Errors
 
-| Exception                       | Cause                                                       |
-| ------------------------------- | ----------------------------------------------------------- |
-| `InsufficientFundsException`    | Available sats < amount.                                    |
-| `SparkWithdrawalException`      | SSP refused the quote (e.g. amount below dust threshold).    |
-| `SparkConnectionException`      | gRPC / HTTP transport problem. Often retryable.             |
-| `SparkAuthenticationException`  | Wallet identity rejected by SO or SSP.                      |
-| `SparkSignerException`          | FROST signing failed locally.                               |
+| Exception                         | Cause                                                                 |
+| --------------------------------- | --------------------------------------------------------------------- |
+| `SparkConfigurationException`     | Destination address malformed or for another network.                 |
+| `FeeExceedsLimitException`        | SSP quote above `maxFeeSats`, or the fee would consume the amount.    |
+| `SparkUntrustedResponseException` | The SSP's exit or connector transaction failed verification.          |
+| `SparkWithdrawalException`        | The coordinator or SSP refused the exit.                              |
+| `SparkConnectionException`        | gRPC / HTTP transport problem. Often retryable.                       |
+| `SparkAuthenticationException`    | Wallet identity rejected by SO or SSP.                                |
+| `SparkSignerException`            | FROST signing failed locally.                                         |
 
 See [`error-handling.md`](error-handling.md) for the full hierarchy.
-
-Most withdrawal failures happen at the SSP quote step (insufficient
-liquidity, amount too small, destination address malformed). NSpark
-surfaces those as `SparkWithdrawalException` with the SSP's
-human-readable reason.
 
 ## Idempotency
 

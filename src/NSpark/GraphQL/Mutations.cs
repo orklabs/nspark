@@ -63,11 +63,13 @@ internal static class Mutations
         mutation RequestLightningSend(
             $encoded_invoice: String!,
             $idempotency_key: String,
+            $amount_sats: Long,
             $user_outbound_transfer_external_id: UUID
         ) {
             request_lightning_send(input: {
                 encoded_invoice: $encoded_invoice
                 idempotency_key: $idempotency_key
+                amount_sats: $amount_sats
                 user_outbound_transfer_external_id: $user_outbound_transfer_external_id
             }) {
                 request {
@@ -122,6 +124,7 @@ internal static class Mutations
                 request {
                     id
                     raw_connector_transaction
+                    raw_coop_exit_transaction
                     coop_exit_txid
                     status
                 }

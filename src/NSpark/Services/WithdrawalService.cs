@@ -1,14 +1,21 @@
 using System.Security.Cryptography;
 using Google.Protobuf;
+using NSpark.Exceptions;
 using NSpark.GraphQL;
 using NSpark.Models;
 using NSpark.Proto;
+using NSpark.Signer;
 
 namespace NSpark.Services;
 
-/// <inheritdoc/>
+/// <summary>
+/// Extension methods on <see cref="SparkWallet"/> for withdrawing to Bitcoin L1 through a
+/// cooperative exit brokered by the SSP.
+/// </summary>
 public static class WithdrawalService
 {
+    private const string Operation = "withdrawal.withdraw";
+
     /// <summary>
     /// Get a fee estimate for an on-chain withdrawal (cooperative exit).
     /// </summary>
@@ -38,27 +45,104 @@ public static class WithdrawalService
     }
 
     /// <summary>
-    /// Withdraw from Spark to an on-chain Bitcoin address (cooperative exit).
+    /// Withdraw from Spark to an on-chain Bitcoin address via a cooperative exit brokered by
+    /// the SSP.
     /// </summary>
-    /// <returns>The L1 transaction ID.</returns>
+    /// <remarks>
+    /// <para>
+    /// The SSP's fee is deducted from <paramref name="amountSats"/>: the destination receives
+    /// <paramref name="amountSats"/> minus the fee. Leaves are swapped to denominations that sum
+    /// to exactly <paramref name="amountSats"/> first, so no more than the requested amount ever
+    /// leaves the wallet.
+    /// </para>
+    /// <para>
+    /// Before anything is signed the SSP's response is verified: the exit transaction must hash
+    /// to the txid it reports, pay <paramref name="onChainAddress"/> at least
+    /// <paramref name="amountSats"/> minus the fee cap, and the connector transaction must spend
+    /// it. A response that fails these checks throws <see cref="SparkUntrustedResponseException"/>
+    /// and no leaves are handed over.
+    /// </para>
+    /// <para>
+    /// The exit speaks the protocol the coordinator requires today: the connector-input refund
+    /// transactions are FROST-signed by the user and sent together with the encrypted key-tweak
+    /// package in a single <c>cooperative_exit_v2</c> call, as the reference SDK's
+    /// <c>CoopExitService</c> does. The older two-step form (unsigned jobs, then
+    /// <c>finalize_transfer_with_transfer_package</c>) is rejected by mainnet.
+    /// </para>
+    /// </remarks>
+    /// <param name="wallet">The Spark wallet.</param>
+    /// <param name="onChainAddress">Destination Bitcoin address on the wallet's network (P2PKH, P2SH, P2WPKH, P2WSH, or P2TR).</param>
+    /// <param name="amountSats">Amount in sats to withdraw, fee included.</param>
+    /// <param name="maxFeeSats">
+    /// Highest fee the caller accepts. When <c>null</c> the SSP's fee quote for the selected
+    /// leaves is used as the bound. Throws <see cref="FeeExceedsLimitException"/> if the quote is
+    /// above the cap, or if the cap would consume the whole amount.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The L1 transaction id of the cooperative exit (display order, big-endian hex).</returns>
     public static async Task<string> WithdrawAsync(
         this SparkWallet wallet,
         string onChainAddress,
         long amountSats,
+        long? maxFeeSats = null,
         CancellationToken ct = default)
     {
-        var coordinatorAddress = wallet.Client.Options.SigningOperatorAddresses[0];
+        ArgumentNullException.ThrowIfNull(wallet);
+        ArgumentException.ThrowIfNullOrWhiteSpace(onChainAddress);
+        if (amountSats <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(amountSats), amountSats, "Withdrawal amount must be positive.");
+        }
+
+        var network = wallet.Client.Options.Network;
+
+        // Fail fast on a malformed or wrong-network destination, before any leaf is moved.
+        _ = CoopExitValidator.ScriptPubKeyFor(onChainAddress, network);
+
+        // Select leaves that sum to exactly the requested amount (swapping via the SSP if
+        // needed): the SSP exits the full value of the leaves it is given.
+        var selectedLeaves = await wallet.SelectLeavesWithSwapAsync(amountSats, ct).ConfigureAwait(false);
+        var selectedTotal = selectedLeaves.Sum(l => l.ValueSats);
+        if (selectedTotal != amountSats)
+        {
+            throw new SparkWithdrawalException(
+                Operation, $"Selected leaves sum to {selectedTotal} sats, expected exactly {amountSats}.");
+        }
+
+        // Bound the fee before asking the SSP to build the exit.
+        var quote = await wallet.GetFeeQuoteAsync(
+            selectedLeaves.Select(l => l.Id).ToArray(), onChainAddress, ct).ConfigureAwait(false);
+        var feeCap = CoopExitValidator.ResolveFeeCap(quote.FeeSats, maxFeeSats, amountSats);
+
+        return await PerformCooperativeExitAsync(
+            wallet, selectedLeaves, amountSats, feeCap, onChainAddress, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The cooperative exit proper: request the exit from the SSP, verify what it built, sign
+    /// the connector refunds, hand the leaves over in one transfer package, complete via the
+    /// SSP. <paramref name="selectedLeaves"/> must sum to <paramref name="amountSats"/>; the
+    /// payout must be at least <c>amountSats - feeCap</c>.
+    /// </summary>
+    private static async Task<string> PerformCooperativeExitAsync(
+        SparkWallet wallet,
+        IReadOnlyList<SparkLeaf> selectedLeaves,
+        long amountSats,
+        long feeCap,
+        string onChainAddress,
+        CancellationToken ct)
+    {
+        var options = wallet.Client.Options;
+        var coordinatorAddress = options.SigningOperatorAddresses[0];
         var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
         var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
-        var networkStr = FrostSigningHelper.GetNetworkString(wallet.Client.Options.Network);
-
-        // Step 1: Select leaves covering amount (exact match or swap)
-        var selectedLeaves = await wallet.SelectLeavesWithSwapAsync(amountSats, ct).ConfigureAwait(false);
+        var networkStr = FrostSigningHelper.GetNetworkString(options.Network);
         var leafIds = selectedLeaves.Select(l => l.Id).ToArray();
+        var minimumPayoutSats = amountSats - feeCap;
+        var receiverPubKey = Convert.FromHexString(options.SspIdentityPublicKeyHex);
 
-        // Step 2: Request coop exit from SSP
-        var transferId = Guid.NewGuid().ToString().ToLowerInvariant();
-
+        // Step 1: ask the SSP to build the exit and connector transactions.
+        var transferId = Guid.NewGuid().ToString("D");
         var sspResponse = await wallet.SspClient.ExecuteAsync<RequestCoopExitResponse>(
             Mutations.RequestCoopExit,
             new Dictionary<string, object>
@@ -70,238 +154,78 @@ public static class WithdrawalService
                 ["user_outbound_transfer_external_id"] = transferId,
             },
             ct).ConfigureAwait(false);
+        var request = sspResponse.RequestCoopExit.Request;
 
-        var connectorTxHex = sspResponse.RequestCoopExit.Request.RawConnectorTransaction;
-        var coopExitTxid = sspResponse.RequestCoopExit.Request.CoopExitTxid;
-        var connectorTxBytes = Convert.FromHexString(connectorTxHex);
-        var connectorTxId = ComputeTxId(connectorTxBytes);
+        // Step 2: verify what the SSP built before signing anything.
+        var validated = CoopExitValidator.Validate(
+            request.RawCoopExitTransaction,
+            request.RawConnectorTransaction,
+            request.CoopExitTxid,
+            onChainAddress,
+            minimumPayoutSats,
+            selectedLeaves.Count,
+            options.Network);
+        var connectorTxBytes = Convert.FromHexString(request.RawConnectorTransaction.Trim());
 
-        // Step 3: Build LeafRefundTxSigningJobs with connector inputs
-        var receiverPubKey = Convert.FromHexString(wallet.Client.Options.SspIdentityPublicKeyHex);
-        var expiryTime = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(
-            DateTimeOffset.UtcNow.AddDays(7).AddMinutes(5));
+        // Step 3: operator nonce commitments, three per leaf (cpfp, direct, directFromCpfp),
+        // laid out leaf-major like the transfer flow.
+        var commitmentsRequest = new GetSigningCommitmentsRequest { Count = 3 };
+        commitmentsRequest.NodeIds.AddRange(leafIds);
+        var commitmentsResponse = await coordinatorClient.get_signing_commitmentsAsync(
+            commitmentsRequest, headers, cancellationToken: ct).ConfigureAwait(false);
+        var commitments = commitmentsResponse.SigningCommitments;
+        if (commitments.Count < 3 * selectedLeaves.Count)
+        {
+            throw new SparkWithdrawalException(
+                Operation, $"Got {commitments.Count} signing commitments, need {3 * selectedLeaves.Count}.");
+        }
 
-        var signingJobs = new List<LeafRefundTxSigningJob>();
-        var leafDataList = new List<LeafSigningData>();
-
+        // Step 4: refund transactions that also spend a connector output, FROST-signed by the user.
+        var cpfpJobs = new List<UserSignedTxSigningJob>(selectedLeaves.Count);
+        var directJobs = new List<UserSignedTxSigningJob>(selectedLeaves.Count);
+        var directFromCpfpJobs = new List<UserSignedTxSigningJob>(selectedLeaves.Count);
         for (int i = 0; i < selectedLeaves.Count; i++)
         {
             var leaf = selectedLeaves[i];
-            var node = leaf.Node;
-            var verifyingKey = node.VerifyingPublicKey.ToByteArray();
+            var verifyingKey = leaf.Node.VerifyingPublicKey.ToByteArray();
+            var connectorOutput = validated.ConnectorTx.Outputs[i];
+            var refunds = BuildConnectorRefunds(
+                leaf.Node,
+                receiverPubKey,
+                validated.ConnectorTxidInternal,
+                connectorOutput.ScriptPubKey.ToBytes(),
+                (ulong)connectorOutput.Value.Satoshi,
+                (uint)i,
+                networkStr);
 
-            // Get current sequence and decrement
-            var refundTxBytes = node.RefundTx.Length > 0
-                ? node.RefundTx.ToByteArray()
-                : node.NodeTx.ToByteArray();
-            var (cpfpSequence, directSequence) = TimelockHelper.ComputeNextSequences(
-                refundTxBytes, "withdrawal.withdraw", leaf.Id);
+            cpfpJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
+                wallet.Signer, leaf.Id, verifyingKey,
+                refunds.Cpfp.Tx, refunds.Cpfp.Sighash,
+                commitments[i].SigningNonceCommitments, ct).ConfigureAwait(false));
 
-            var cpfpNodeTx = node.NodeTx.ToByteArray();
-            var directNodeTx = node.DirectTx.Length > 0 ? node.DirectTx.ToByteArray() : null;
-            var isZeroNode = IsZeroTimelockNode(cpfpNodeTx);
-
-            // Build refund txs (single input)
-            var refundTrio = SparkTxBuilder.BuildRefundTxTrio(
-                cpfpNodeTx: cpfpNodeTx,
-                directNodeTx: directNodeTx,
-                vout: 0,
-                receivingPublicKey: receiverPubKey,
-                network: networkStr,
-                sequence: cpfpSequence,
-                directSequence: directSequence,
-                // SSP validates all three refund outputs on coop-exit and rejects with
-                // "expected value X on output 0" if the standard fee isn't deducted.
-                feeSats: SparkConstants.DefaultRefundFeeSats);
-
-            // Add connector input to each refund tx
-            var connectorInput = MakeConnectorInputBytes(connectorTxId, (uint)i);
-            var cpfpRefundWithConnector = AddInputToRawTx(refundTrio.CpfpRefund.Tx, connectorInput);
-
-            byte[]? directRefundWithConnector = null;
-            if (refundTrio.DirectRefund != null && !isZeroNode)
+            if (refunds.Direct is { } direct)
             {
-                directRefundWithConnector = AddInputToRawTx(refundTrio.DirectRefund.Tx, connectorInput);
+                directJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
+                    wallet.Signer, leaf.Id, verifyingKey,
+                    direct.Tx, direct.Sighash,
+                    commitments[i + selectedLeaves.Count].SigningNonceCommitments, ct).ConfigureAwait(false));
             }
 
-            var directFromCpfpRefundWithConnector = AddInputToRawTx(
-                refundTrio.DirectFromCpfpRefund.Tx, connectorInput);
-
-            // Generate three FROST nonce commitments via the signer (phase 1). The actual
-            // sighashes aren't known yet — the SO returns the final tx after combining the
-            // connector — so we commit to nonces now and sign later.
-            var cpfpNonce = await wallet.Signer.GenerateLeafFrostNonceAsync(leaf.Id, ct).ConfigureAwait(false);
-            var directNonce = await wallet.Signer.GenerateLeafFrostNonceAsync(leaf.Id, ct).ConfigureAwait(false);
-            var directFromCpfpNonce = await wallet.Signer.GenerateLeafFrostNonceAsync(leaf.Id, ct).ConfigureAwait(false);
-            var signingPubKey = cpfpNonce.PublicKey;
-
-            // Build SigningJob for each refund tx (unsigned — just commitment)
-            var cpfpSigningJob = new SigningJob
-            {
-                SigningPublicKey = ByteString.CopyFrom(signingPubKey),
-                RawTx = ByteString.CopyFrom(cpfpRefundWithConnector),
-                SigningNonceCommitment = new Proto.Common.SigningCommitment
-                {
-                    Hiding = ByteString.CopyFrom(cpfpNonce.Commitment.Hiding),
-                    Binding = ByteString.CopyFrom(cpfpNonce.Commitment.Binding),
-                },
-            };
-
-            var directFromCpfpSigningJob = new SigningJob
-            {
-                SigningPublicKey = ByteString.CopyFrom(signingPubKey),
-                RawTx = ByteString.CopyFrom(directFromCpfpRefundWithConnector),
-                SigningNonceCommitment = new Proto.Common.SigningCommitment
-                {
-                    Hiding = ByteString.CopyFrom(directFromCpfpNonce.Commitment.Hiding),
-                    Binding = ByteString.CopyFrom(directFromCpfpNonce.Commitment.Binding),
-                },
-            };
-
-            var leafJob = new LeafRefundTxSigningJob
-            {
-                LeafId = leaf.Id,
-                RefundTxSigningJob = cpfpSigningJob,
-                DirectFromCpfpRefundTxSigningJob = directFromCpfpSigningJob,
-            };
-
-            if (directRefundWithConnector != null)
-            {
-                leafJob.DirectRefundTxSigningJob = new SigningJob
-                {
-                    SigningPublicKey = ByteString.CopyFrom(signingPubKey),
-                    RawTx = ByteString.CopyFrom(directRefundWithConnector),
-                    SigningNonceCommitment = new Proto.Common.SigningCommitment
-                    {
-                        Hiding = ByteString.CopyFrom(directNonce.Commitment.Hiding),
-                        Binding = ByteString.CopyFrom(directNonce.Commitment.Binding),
-                    },
-                };
-            }
-
-            signingJobs.Add(leafJob);
-            leafDataList.Add(new LeafSigningData(
-                leaf.Id, signingPubKey, verifyingKey,
-                cpfpRefundWithConnector, directRefundWithConnector, directFromCpfpRefundWithConnector,
-                cpfpNonce, directNonce, directFromCpfpNonce,
-                cpfpNodeTx, directNodeTx, i));
+            directFromCpfpJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
+                wallet.Signer, leaf.Id, verifyingKey,
+                refunds.DirectFromCpfp.Tx, refunds.DirectFromCpfp.Sighash,
+                commitments[i + (2 * selectedLeaves.Count)].SigningNonceCommitments, ct).ConfigureAwait(false));
         }
 
-        // Step 4: Call cooperative_exit_v2
-        var coopExitTxidBytes = Convert.FromHexString(coopExitTxid);
-        Array.Reverse(coopExitTxidBytes);
-
-        var transferRequest = new StartTransferRequest
-        {
-            TransferId = transferId,
-            OwnerIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
-            ReceiverIdentityPublicKey = ByteString.CopyFrom(receiverPubKey),
-            ExpiryTime = expiryTime,
-        };
-        transferRequest.LeavesToSend.AddRange(signingJobs);
-
-        var exitResponse = await coordinatorClient.cooperative_exit_v2Async(
-            new CooperativeExitRequest
-            {
-                Transfer = transferRequest,
-                ExitId = Guid.NewGuid().ToString().ToLowerInvariant(),
-                ExitTxid = ByteString.CopyFrom(coopExitTxidBytes),
-                ConnectorTx = ByteString.CopyFrom(connectorTxBytes),
-            },
-            headers,
-            cancellationToken: ct);
-
-        // Step 5: Sign FROST with SO signing results and aggregate
-        var cpfpSignatures = new List<UserSignedTxSigningJob>();
-        var directSignatures = new List<UserSignedTxSigningJob>();
-        var directFromCpfpSignatures = new List<UserSignedTxSigningJob>();
-
-        foreach (var result in exitResponse.SigningResults)
-        {
-            var leafData = leafDataList.First(d => d.LeafId == result.LeafId);
-            var connectorPrevOut = ParseTxOutput(connectorTxBytes, (uint)leafData.ConnectorOutputIndex);
-            var signingPubKey = leafData.SigningPublicKey;
-
-            // Sign CPFP refund (multi-input: node output + connector output)
-            var cpfpNodeOutput = ParseTxOutput(leafData.CpfpNodeTx, 0);
-            var cpfpSighash = SparkTxBuilder.ComputeMultiInputSighash(
-                tx: leafData.CpfpRefundTx,
-                inputIndex: 0,
-                prevOutScripts: [cpfpNodeOutput.Script, connectorPrevOut.Script],
-                prevOutValues: [cpfpNodeOutput.Value, connectorPrevOut.Value]);
-
-            var cpfpAgg = await SignAndAggregateAsync(
-                wallet.Signer, leafData.LeafId, leafData.CpfpNonce,
-                cpfpSighash, leafData.VerifyingKey,
-                result.RefundTxSigningResult, ct).ConfigureAwait(false);
-
-            cpfpSignatures.Add(new UserSignedTxSigningJob
-            {
-                LeafId = result.LeafId,
-                SigningPublicKey = ByteString.CopyFrom(signingPubKey),
-                RawTx = ByteString.CopyFrom(leafData.CpfpRefundTx),
-                UserSignature = ByteString.CopyFrom(cpfpAgg),
-            });
-
-            // Sign direct refund (if exists)
-            if (leafData.DirectRefundTx != null && leafData.DirectNodeTx != null
-                && result.DirectRefundTxSigningResult != null)
-            {
-                var directNodeOutput = ParseTxOutput(leafData.DirectNodeTx, 0);
-                var directSighash = SparkTxBuilder.ComputeMultiInputSighash(
-                    tx: leafData.DirectRefundTx,
-                    inputIndex: 0,
-                    prevOutScripts: [directNodeOutput.Script, connectorPrevOut.Script],
-                    prevOutValues: [directNodeOutput.Value, connectorPrevOut.Value]);
-
-                var directAgg = await SignAndAggregateAsync(
-                    wallet.Signer, leafData.LeafId, leafData.DirectNonce,
-                    directSighash, leafData.VerifyingKey,
-                    result.DirectRefundTxSigningResult, ct).ConfigureAwait(false);
-
-                directSignatures.Add(new UserSignedTxSigningJob
-                {
-                    LeafId = result.LeafId,
-                    SigningPublicKey = ByteString.CopyFrom(signingPubKey),
-                    RawTx = ByteString.CopyFrom(leafData.DirectRefundTx),
-                    UserSignature = ByteString.CopyFrom(directAgg),
-                });
-            }
-
-            // Sign directFromCpfp refund
-            var dcfpSighash = SparkTxBuilder.ComputeMultiInputSighash(
-                tx: leafData.DirectFromCpfpRefundTx,
-                inputIndex: 0,
-                prevOutScripts: [cpfpNodeOutput.Script, connectorPrevOut.Script],
-                prevOutValues: [cpfpNodeOutput.Value, connectorPrevOut.Value]);
-
-            var dcfpAgg = await SignAndAggregateAsync(
-                wallet.Signer, leafData.LeafId, leafData.DirectFromCpfpNonce,
-                dcfpSighash, leafData.VerifyingKey,
-                result.DirectFromCpfpRefundTxSigningResult, ct).ConfigureAwait(false);
-
-            directFromCpfpSignatures.Add(new UserSignedTxSigningJob
-            {
-                LeafId = result.LeafId,
-                SigningPublicKey = ByteString.CopyFrom(signingPubKey),
-                RawTx = ByteString.CopyFrom(leafData.DirectFromCpfpRefundTx),
-                UserSignature = ByteString.CopyFrom(dcfpAgg),
-            });
-        }
-
-        // Step 6: Prepare key tweaks (transfer leaves to SSP)
+        // Step 5: key tweaks handing the leaves to the SSP, encrypted per operator and signed.
         var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
-            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct);
-        var soOperators = soListResponse.SigningOperators;
-        var soCount = (uint)soOperators.Count;
-        var threshold = (uint)Math.Max(2, (soCount + 2) / 2);
-
-        var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, wallet.Client.Options.SigningOperators);
+            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct).ConfigureAwait(false);
+        var soTargets = FrostSigningHelper.BuildSoTargets(soListResponse.SigningOperators, options.SigningOperators);
         var leafDescriptors = selectedLeaves
-            .Select(l => new NSpark.Signer.SendTweakLeafDescriptor(l.Id, receiverPubKey))
+            .Select(l => new SendTweakLeafDescriptor(l.Id, receiverPubKey))
             .ToList();
         var encryptedBatch = await wallet.Signer.BuildEncryptedSendTweaksAsync(
-            leafDescriptors, soTargets, transferId, threshold, ct).ConfigureAwait(false);
+            leafDescriptors, soTargets, transferId, options.EffectiveSigningThreshold, ct).ConfigureAwait(false);
 
         var keyTweakPackage = new Dictionary<string, ByteString>(encryptedBatch.EncryptedPackageBySoId.Count);
         foreach (var (soId, blob) in encryptedBatch.EncryptedPackageBySoId)
@@ -309,49 +233,53 @@ public static class WithdrawalService
             keyTweakPackage[soId] = ByteString.CopyFrom(blob);
         }
 
-        // Build TransferPackage with aggregated signatures + key tweaks
         var transferPackage = new TransferPackage { HashVariant = HashVariant.V2 };
-        foreach (var job in cpfpSignatures)
-        {
-            transferPackage.LeavesToSend.Add(job);
-        }
-
-        foreach (var job in directSignatures)
-        {
-            transferPackage.DirectLeavesToSend.Add(job);
-        }
-
-        foreach (var job in directFromCpfpSignatures)
-        {
-            transferPackage.DirectFromCpfpLeavesToSend.Add(job);
-        }
-
+        transferPackage.LeavesToSend.AddRange(cpfpJobs);
+        transferPackage.DirectLeavesToSend.AddRange(directJobs);
+        transferPackage.DirectFromCpfpLeavesToSend.AddRange(directFromCpfpJobs);
         foreach (var (soId, cipher) in keyTweakPackage)
         {
             transferPackage.KeyTweakPackage.Add(soId, cipher);
         }
 
-        // Sign transfer package
-        var transferIdBytes = Convert.FromHexString(transferId.Replace("-", ""));
+        var transferIdBytes = Convert.FromHexString(transferId.Replace("-", "", StringComparison.Ordinal));
         var packageHash = SparkTaggedHash.Create("spark", "transfer", "signing payload")
             .AddBytes(transferIdBytes)
             .AddMapStringToBytes(keyTweakPackage)
             .Hash();
-        var packageSignature = await wallet.Signer.SignWithIdentityKeyAsync(packageHash, ct).ConfigureAwait(false);
-        transferPackage.UserSignature = ByteString.CopyFrom(packageSignature);
+        transferPackage.UserSignature = ByteString.CopyFrom(
+            await wallet.Signer.SignWithIdentityKeyAsync(packageHash, ct).ConfigureAwait(false));
 
-        // Step 7: Finalize transfer with transfer package
-        await coordinatorClient.finalize_transfer_with_transfer_packageAsync(
-            new FinalizeTransferWithTransferPackageRequest
+        // Step 6: cooperative_exit_v2 with the transfer package. The expiry mirrors the
+        // reference SDK: seven days (plus slack) on mainnet, 35 minutes elsewhere.
+        var expiry = options.Network == SparkNetwork.Mainnet
+            ? DateTimeOffset.UtcNow.AddDays(7).AddMinutes(5)
+            : DateTimeOffset.UtcNow.AddMinutes(35);
+        var transferRequest = new StartTransferRequest
+        {
+            TransferId = transferId,
+            OwnerIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
+            ReceiverIdentityPublicKey = ByteString.CopyFrom(receiverPubKey),
+            ExpiryTime = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(expiry),
+            TransferPackage = transferPackage,
+        };
+
+        var exitResponse = await coordinatorClient.cooperative_exit_v2Async(
+            new CooperativeExitRequest
             {
-                TransferId = exitResponse.Transfer.Id,
-                OwnerIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
-                TransferPackage = transferPackage,
+                Transfer = transferRequest,
+                ExitId = Guid.NewGuid().ToString("D"),
+                ExitTxid = ByteString.CopyFrom(validated.ExitTxidInternal),
+                ConnectorTx = ByteString.CopyFrom(connectorTxBytes),
             },
             headers,
-            cancellationToken: ct);
+            cancellationToken: ct).ConfigureAwait(false);
+        if (exitResponse.Transfer is null)
+        {
+            throw new SparkWithdrawalException(Operation, "cooperative_exit_v2 returned no transfer.");
+        }
 
-        // Step 8: Complete coop exit via SSP
+        // Step 7: complete the exit via the SSP, which broadcasts once the transfer is in place.
         await wallet.SspClient.ExecuteAsync<CompleteCoopExitResponse>(
             Mutations.CompleteCoopExit,
             new Dictionary<string, object>
@@ -360,64 +288,88 @@ public static class WithdrawalService
             },
             ct).ConfigureAwait(false);
 
-        return coopExitTxid;
+        return validated.ExitTxidHex;
+    }
+
+    // ── Connector refunds ──
+
+    /// <summary>A refund transaction with the connector output appended, and its two-input sighash.</summary>
+    internal sealed record ConnectorRefund(byte[] Tx, byte[] Sighash);
+
+    /// <summary>
+    /// The three connector refunds of one leaf. <see cref="Direct"/> is absent for zero-timelock
+    /// nodes and leaves without a direct node transaction.
+    /// </summary>
+    internal sealed record ConnectorRefunds(ConnectorRefund Cpfp, ConnectorRefund? Direct, ConnectorRefund DirectFromCpfp);
+
+    /// <summary>
+    /// The leaf's next refund transactions with the connector output appended as a second
+    /// input, and their two-input sighashes (BIP-341, prevouts = node output + connector
+    /// output). This is what the user signs for a cooperative exit; mirrors the reference SDK's
+    /// <c>createConnectorRefundTxs</c> + <c>signRefundsForCoopExit</c>.
+    /// </summary>
+    internal static ConnectorRefunds BuildConnectorRefunds(
+        TreeNode node,
+        byte[] receiverPubKey,
+        byte[] connectorTxidInternal,
+        byte[] connectorOutputScript,
+        ulong connectorOutputValue,
+        uint connectorVout,
+        string networkStr)
+    {
+        var refundTxBytes = node.RefundTx.Length > 0
+            ? node.RefundTx.ToByteArray()
+            : node.NodeTx.ToByteArray();
+        var (cpfpSequence, directSequence) = TimelockHelper.ComputeNextSequences(
+            refundTxBytes, Operation, node.Id);
+
+        var cpfpNodeTx = node.NodeTx.ToByteArray();
+        var isZeroNode = IsZeroTimelockNode(cpfpNodeTx);
+        var directNodeTx = node.DirectTx.Length == 0 || isZeroNode ? null : node.DirectTx.ToByteArray();
+
+        var trio = SparkTxBuilder.BuildRefundTxTrio(
+            cpfpNodeTx: cpfpNodeTx,
+            directNodeTx: directNodeTx,
+            vout: 0,
+            receivingPublicKey: receiverPubKey,
+            network: networkStr,
+            sequence: cpfpSequence,
+            directSequence: directSequence,
+            // The SSP validates all three refund outputs on coop-exit and rejects with
+            // "expected value X on output 0" if the standard fee isn't deducted.
+            feeSats: SparkConstants.DefaultRefundFeeSats);
+
+        var connectorInput = MakeConnectorInputBytes(connectorTxidInternal, connectorVout);
+        var nodeOutput = ParseTxOutput(cpfpNodeTx, 0);
+
+        ConnectorRefund WithConnector(byte[] refundTx, (byte[] Script, ulong Value) spending)
+        {
+            var tx = AddInputToRawTx(refundTx, connectorInput);
+            var sighash = SparkTxBuilder.ComputeMultiInputSighash(
+                tx: tx,
+                inputIndex: 0,
+                prevOutScripts: [spending.Script, connectorOutputScript],
+                prevOutValues: [spending.Value, connectorOutputValue]);
+            return new ConnectorRefund(tx, sighash);
+        }
+
+        var cpfp = WithConnector(trio.CpfpRefund.Tx, nodeOutput);
+        ConnectorRefund? direct = null;
+        if (trio.DirectRefund is { } directRefund && directNodeTx is not null)
+        {
+            direct = WithConnector(directRefund.Tx, ParseTxOutput(directNodeTx, 0));
+        }
+        var directFromCpfp = WithConnector(trio.DirectFromCpfpRefund.Tx, nodeOutput);
+        return new ConnectorRefunds(cpfp, direct, directFromCpfp);
     }
 
     // ── Raw tx helpers ──
-
-    private sealed record LeafSigningData(
-        string LeafId,
-        byte[] SigningPublicKey,
-        byte[] VerifyingKey,
-        byte[] CpfpRefundTx,
-        byte[]? DirectRefundTx,
-        byte[] DirectFromCpfpRefundTx,
-        NSpark.Signer.LeafFrostNonceCommitment CpfpNonce,
-        NSpark.Signer.LeafFrostNonceCommitment DirectNonce,
-        NSpark.Signer.LeafFrostNonceCommitment DirectFromCpfpNonce,
-        byte[] CpfpNodeTx,
-        byte[]? DirectNodeTx,
-        int ConnectorOutputIndex);
-
-    /// <summary>
-    /// Phase 2 of withdrawal FROST signing: given a leaf's previously-issued nonce, the
-    /// recomputed sighash, and the SO's signing result, ask the signer to sign with the
-    /// nonce and then aggregate locally (aggregation is a pure-public-key op).
-    /// </summary>
-    private static async Task<byte[]> SignAndAggregateAsync(
-        NSpark.Signer.ISparkSigner signer,
-        string leafId,
-        NSpark.Signer.LeafFrostNonceCommitment nonce,
-        byte[] sighash,
-        byte[] verifyingKey,
-        SigningResult signingResult,
-        CancellationToken ct)
-    {
-        var soCommitments = new Dictionary<string, NSpark.Signer.SigningCommitment>();
-        foreach (var (soId, c) in signingResult.SigningNonceCommitments)
-        {
-            soCommitments[soId] = new NSpark.Signer.SigningCommitment(c.Hiding.ToByteArray(), c.Binding.ToByteArray());
-        }
-
-        var selfSignature = await signer.SignLeafFrostWithNonceAsync(
-            leafId, nonce.NonceHandle, sighash, verifyingKey, soCommitments, adaptorPublicKey: null, ct)
-            .ConfigureAwait(false);
-
-        return FrostSigningHelper.AggregateFrostSignature(
-            sighash: sighash,
-            selfCommitment: nonce.Commitment,
-            selfSignature: selfSignature,
-            selfPublicKey: nonce.PublicKey,
-            verifyingKey: verifyingKey,
-            signingResult: signingResult,
-            adaptorPublicKey: null);
-    }
 
     /// <summary>
     /// Compute txid from raw transaction bytes (double SHA-256 of witness-stripped serialization).
     /// Returns bytes in internal byte order (used as prevout hash in inputs).
     /// </summary>
-    private static byte[] ComputeTxId(byte[] rawTx)
+    internal static byte[] ComputeTxId(byte[] rawTx)
     {
         var strippedTx = StripWitness(rawTx);
         var hash1 = SHA256.HashData(strippedTx);
@@ -427,7 +379,7 @@ public static class WithdrawalService
     /// <summary>
     /// Strip witness data from a segwit transaction to get legacy serialization for txid.
     /// </summary>
-    private static byte[] StripWitness(byte[] rawTx)
+    internal static byte[] StripWitness(byte[] rawTx)
     {
         int offset = 4; // skip version
         bool hasWitness = rawTx.Length > 5 && rawTx[offset] == 0x00 && rawTx[offset + 1] == 0x01;
@@ -496,8 +448,12 @@ public static class WithdrawalService
         }
 
         // Parse outputs
-        var (_, outputCountLen) = ReadVarInt(rawTx, offset);
+        var (outputCount, outputCountLen) = ReadVarInt(rawTx, offset);
         offset += outputCountLen;
+        if (vout >= outputCount)
+        {
+            throw new InvalidOperationException($"vout {vout} not found in transaction with {outputCount} outputs");
+        }
 
         for (uint i = 0; i <= vout; i++)
         {
@@ -521,7 +477,7 @@ public static class WithdrawalService
     /// <summary>
     /// Check if a node tx has zero timelock (sequence lower 16 bits == 0).
     /// </summary>
-    private static bool IsZeroTimelockNode(byte[] nodeTx)
+    internal static bool IsZeroTimelockNode(byte[] nodeTx)
     {
         var seq = ClaimService.ParseInputSequence(nodeTx);
         return (seq & 0xFFFF) == 0;
@@ -530,7 +486,7 @@ public static class WithdrawalService
     /// <summary>
     /// Create raw bytes for a connector input: txid(32) + vout(4) + empty scriptSig(1) + sequence(4).
     /// </summary>
-    private static byte[] MakeConnectorInputBytes(byte[] txId, uint vout)
+    internal static byte[] MakeConnectorInputBytes(byte[] txId, uint vout)
     {
         var input = new byte[32 + 4 + 1 + 4]; // 41 bytes
         // txid already in internal byte order
@@ -547,7 +503,7 @@ public static class WithdrawalService
     /// Add an input to a raw Bitcoin transaction, bumping the input count varint and
     /// handling witness data if present.
     /// </summary>
-    private static byte[] AddInputToRawTx(byte[] rawTx, byte[] input)
+    internal static byte[] AddInputToRawTx(byte[] rawTx, byte[] input)
     {
         int offset = 4; // skip version
         bool hasWitness = rawTx.Length > 5 && rawTx[offset] == 0x00 && rawTx[offset + 1] == 0x01;

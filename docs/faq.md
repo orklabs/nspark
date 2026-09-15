@@ -18,11 +18,15 @@ subscribe to `SubscribeEventsAsync` and call claim on each
 
 ## What's the difference between `SatsBalance.Available` and `SatsBalance.Owned`?
 
-- `Available` — sats backed by leaves with status `AVAILABLE`, ready to
-  spend right now.
-- `Owned` — `Available` plus sats locked in in-flight outgoing transfers
-  / swaps / renewals (statuses `TRANSFER_LOCKED`, `SPLIT_LOCKED`,
-  `AGGREGATE_LOCK`, `RENEW_LOCKED`).
+- `Available` — sats backed by leaves with status `AVAILABLE` whose refund
+  timelock is above the floor, ready to spend right now.
+- `Frozen` — sats in `AVAILABLE` leaves at the timelock floor. The
+  coordinator will neither move nor renew them; only a unilateral exit
+  recovers them (see [`recovery.md`](recovery.md)).
+- `Owned` — `Available` plus `Frozen` plus sats locked in in-flight
+  outgoing transfers / swaps / renewals (statuses `TRANSFER_LOCKED`,
+  `SPLIT_LOCKED`, `AGGREGATE_LOCK`, `RENEW_LOCKED`). `Locked` is that last
+  part on its own.
 - `Incoming` — pending inbound transfers + `CREATING` deposits not yet
   claimed.
 

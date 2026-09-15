@@ -16,12 +16,22 @@ SparkException (abstract)
 │   ├── InvalidBolt11Exception
 │   ├── InsufficientFundsException
 │   ├── PaymentFailedException
-│   └── InvoiceExpiredException
+│   ├── InvoiceExpiredException
+│   └── SparkLightningSendIncompleteException  resume with the carried TransferId
+├── FeeExceedsLimitException           not retryable — raise the cap or wait
+├── SparkUntrustedResponseException    not retryable — a remote response failed verification
 ├── SparkLeafTimelockExhaustedException  not retryable — renew the leaf first
 ├── SparkTransferException
 ├── SparkDepositException
 └── SparkWithdrawalException
 ```
+
+`SparkUntrustedResponseException` means NSpark refused to sign or hand
+anything over because a remote party's response did not verify: an SSP
+cooperative-exit transaction that does not pay the requested address, an
+SSP invoice without the wallet's payment hash, a coordinator token
+transaction that differs from the submitted one, or an inbound transfer
+whose leaves lack a valid sender signature.
 
 ## What's retryable?
 
@@ -49,7 +59,7 @@ pipeline that handles the retryable codes with exponential backoff + jitter.
 ```csharp
 try
 {
-    await wallet.PayLightningInvoiceAsync(bolt11, maxFeeSats: 100, ct);
+    await wallet.PayLightningInvoiceAsync(bolt11, maxFeeSats: 100, ct: ct);
 }
 catch (InvalidBolt11Exception ex)
 {

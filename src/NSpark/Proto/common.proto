@@ -35,3 +35,18 @@ enum SignatureIntent {
     REFRESH = 3 [deprecated = true];
     EXTEND = 4 [deprecated = true];
 }
+
+// The scheme used to produce a Signature.
+enum SignatureScheme {
+    SIGNATURE_SCHEME_UNSPECIFIED = 0;
+    // secp256k1 ECDSA, strict DER encoding (variable length).
+    SIGNATURE_SCHEME_ECDSA = 1;
+    // BIP-340 Schnorr over secp256k1, 64 bytes.
+    SIGNATURE_SCHEME_SCHNORR = 2;
+}
+
+// A signature tagged with the scheme used to produce it, which determines how to verify it.
+message Signature {
+    SignatureScheme scheme = 1;
+    bytes signature = 2;
+}

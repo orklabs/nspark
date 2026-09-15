@@ -33,7 +33,6 @@ public static class TransferService
             headers,
             cancellationToken: ct);
         var soOperators = soListResponse.SigningOperators;
-        var soCount = (uint)soOperators.Count;
 
         // Step 3: Get SO signing commitments for selected leaves
         // Count=3: cpfp, direct, directFromCpfp refund
@@ -49,7 +48,7 @@ public static class TransferService
         // Step 4: Build encrypted per-SO tweak packages via the signer — no plaintext share
         // material ever crosses the wallet boundary.
         transferId ??= Guid.NewGuid().ToString();
-        var threshold = (uint)Math.Max(2, (soCount + 2) / 2);
+        var threshold = wallet.Client.Options.EffectiveSigningThreshold;
 
         var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, wallet.Client.Options.SigningOperators);
         var leafDescriptors = selectedLeaves

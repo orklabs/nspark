@@ -52,6 +52,37 @@ public sealed class SparkOptions
     /// </summary>
     public string SspIdentityPublicKeyHex { get; set; } = GetSspIdentityPublicKey(SparkNetwork.Mainnet);
 
+    /// <summary>
+    /// FROST signing threshold the operators enforce. <c>null</c> (the default) derives it from
+    /// the number of configured operators the way the Spark deployments do: 2 of 3 on mainnet,
+    /// 3 of 5. Set it explicitly only for a custom operator set.
+    /// </summary>
+    public uint? SigningThreshold { get; set; }
+
+    /// <summary>
+    /// Withdraw bond, in satoshis, the coordinator is expected to set on every token output it
+    /// finalises. A final token transaction carrying a different bond is refused before the
+    /// wallet signs it (reference SDK default: 10 000).
+    /// </summary>
+    public ulong ExpectedWithdrawBondSats { get; set; } = 10_000;
+
+    /// <summary>
+    /// Relative block locktime the coordinator is expected to set on every token output it
+    /// finalises. A final token transaction carrying a different locktime is refused before the
+    /// wallet signs it (reference SDK default: 1 000).
+    /// </summary>
+    public ulong ExpectedWithdrawRelativeBlockLocktime { get; set; } = 1_000;
+
+    /// <summary>
+    /// The signing threshold in effect: <see cref="SigningThreshold"/> when set, otherwise the
+    /// deployment default for the configured operator count.
+    /// </summary>
+    public uint EffectiveSigningThreshold => SigningThreshold ?? DefaultSigningThreshold(SigningOperators.Length);
+
+    /// <summary>The threshold the Spark deployments use for a given operator count (2 of 3, 3 of 5).</summary>
+    public static uint DefaultSigningThreshold(int operatorCount) =>
+        Math.Max(2u, ((uint)Math.Max(operatorCount, 0) + 2u) / 2u);
+
     /// <summary>Return the canonical SSP identity public key for the given network.</summary>
     public static string GetSspIdentityPublicKey(SparkNetwork network) => network switch
     {

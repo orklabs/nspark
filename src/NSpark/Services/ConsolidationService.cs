@@ -101,12 +101,7 @@ public static class ConsolidationService
     /// </summary>
     private static List<SparkLeaf> Swappable(IReadOnlyList<SparkLeaf> leaves)
     {
-        return leaves
-            .Where(l => TimelockHelper.TimelockCanDecrement(
-                l.Node.RefundTx.Length > 0
-                    ? l.Node.RefundTx.ToByteArray()
-                    : l.Node.NodeTx.ToByteArray()))
-            .ToList();
+        return leaves.Where(l => l.IsSpendable).ToList();
     }
 
     /// <summary>

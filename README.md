@@ -42,13 +42,13 @@ var wallet = await spark.CreateWalletAsync(mnemonic);
 var invoice = await wallet.CreateLightningInvoiceAsync(amountSats: 21_000, memo: "hello world");
 Console.WriteLine(invoice.PaymentRequest);
 
-// Send
-await wallet.PayLightningInvoiceAsync("lnbc...");
+// Send (maxFeeSats caps the routing fee; the SSP's estimate is checked first)
+await wallet.PayLightningInvoiceAsync("lnbc...", maxFeeSats: 100);
 
 // Balance
 var balance = await wallet.GetBalanceAsync();
-Console.WriteLine($"Available: {balance.SatsBalance.Available} sats");
-Console.WriteLine($"Owned:     {balance.SatsBalance.Owned} sats  (incl. locked in-flight)");
+Console.WriteLine($"Available: {balance.SatsBalance.Available} sats  (spendable right now)");
+Console.WriteLine($"Owned:     {balance.SatsBalance.Owned} sats  (incl. locked in-flight and frozen)");
 Console.WriteLine($"Incoming:  {balance.SatsBalance.Incoming} sats (pending claim)");
 ```
 

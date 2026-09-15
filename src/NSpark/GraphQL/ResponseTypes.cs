@@ -75,6 +75,7 @@ internal sealed record RequestCoopExitWrapper(
 internal sealed record CoopExitRequestData(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("raw_connector_transaction")] string RawConnectorTransaction,
+    [property: JsonPropertyName("raw_coop_exit_transaction")] string? RawCoopExitTransaction,
     [property: JsonPropertyName("coop_exit_txid")] string CoopExitTxid,
     [property: JsonPropertyName("status")] string Status);
 

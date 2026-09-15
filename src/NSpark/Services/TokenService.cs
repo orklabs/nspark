@@ -593,6 +593,20 @@ public static class TokenService
         }
         var finalTx = startResponse.FinalTokenTransaction;
 
+        // The coordinator may only add server-set fields; anything else is refused before the
+        // wallet signs the final hash for each operator (reference SDK: validateTokenTransaction).
+        var options = wallet.Client.Options;
+        TokenTransactionValidator.Validate(
+            finalTx,
+            tx,
+            startResponse.KeyshareInfo,
+            new TokenTransactionValidator.Expectations(
+                CollectOperatorIdentityPublicKeys(wallet),
+                options.SigningOperators.Select(o => o.Identifier).ToHashSet(StringComparer.Ordinal),
+                options.EffectiveSigningThreshold,
+                options.ExpectedWithdrawBondSats,
+                options.ExpectedWithdrawRelativeBlockLocktime));
+
         // Phase 2: hash the final tx, build per-operator signatures, commit.
         var finalHash = TokenHashing.HashTokenTransactionV2(finalTx, partialHash: false);
         var operatorSignatures = await BuildOperatorSignaturesAsync(wallet, finalTx, finalHash, ct).ConfigureAwait(false);

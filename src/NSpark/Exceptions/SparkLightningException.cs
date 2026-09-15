@@ -89,3 +89,36 @@ public sealed class InvoiceExpiredException : SparkLightningException
     {
     }
 }
+
+/// <summary>
+/// The coordinator has already locked the leaves for a Lightning send, but the SSP could not be
+/// asked to pay the invoice (or answered with something unusable). The sats are held by the
+/// transfer identified by <see cref="TransferId"/>, not lost: call
+/// <c>PayLightningInvoiceAsync</c> again with the same invoice and this <see cref="TransferId"/>
+/// to resume the send, or reconcile through the SSP with <see cref="PaymentHash"/>.
+/// </summary>
+public sealed class SparkLightningSendIncompleteException : SparkLightningException
+{
+    /// <summary>Coordinator transfer id holding the leaves; pass it back to resume the send.</summary>
+    public string TransferId { get; }
+
+    /// <summary>Hex payment hash of the invoice being paid.</summary>
+    public string PaymentHash { get; }
+
+    /// <inheritdoc />
+    public SparkLightningSendIncompleteException(string operation, string message, string transferId, string paymentHash)
+        : base(operation, message)
+    {
+        TransferId = transferId;
+        PaymentHash = paymentHash;
+    }
+
+    /// <inheritdoc />
+    public SparkLightningSendIncompleteException(
+        string operation, string message, string transferId, string paymentHash, Exception innerException)
+        : base(operation, message, innerException)
+    {
+        TransferId = transferId;
+        PaymentHash = paymentHash;
+    }
+}

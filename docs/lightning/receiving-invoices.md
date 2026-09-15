@@ -75,6 +75,17 @@ When the payer pays:
 spendable `AVAILABLE` leaf. Until you call it, the value sits in
 `SatsBalance.Incoming`, not `SatsBalance.Available`.
 
+
+### The SSP's invoice is verified before shares are stored
+
+The invoice string the SSP returns is decoded and must carry the wallet's
+own payment hash, the requested amount (or none for an amountless
+request), and the wallet's network. Only then are the preimage shares
+stored with the operators. A mismatch throws
+`SparkUntrustedResponseException` and no share leaves the wallet, so an SSP
+cannot hand out an invoice whose preimage it controls under your wallet's
+name. This mirrors the reference SDK's `validateAndCreateLightningInvoice`.
+
 ## Continuous polling for incoming payments
 
 Server-side wallets typically poll on an interval:

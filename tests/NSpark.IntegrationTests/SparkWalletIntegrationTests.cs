@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Options;
 using NSpark;
 using NSpark.Models;
+using NSpark.GraphQL;
 using NSpark.Services;
 
 namespace NSpark.Tests;
@@ -358,7 +359,7 @@ public class LightningTests
         }
 
         var invoice = await _walletB.CreateLightningInvoiceAsync(10, memo: "integration test", ct: cts.Token);
-        var paymentId = await _walletA.PayLightningInvoiceAsync(invoice.PaymentRequest, ct: cts.Token);
+        var paymentId = await _walletA.PayLightningInvoiceAsync(invoice.PaymentRequest, maxFeeSats: 50, ct: cts.Token);
 
         Assert.That(paymentId, Is.Not.Empty);
         TestContext.Out.WriteLine($"Payment ID: {paymentId}");
@@ -381,7 +382,7 @@ public class LightningTests
             return;
         }
 
-        var paymentId = await _walletA.PayLightningAddressAsync("bub@bub.gg", 10, ct: cts.Token);
+        var paymentId = await _walletA.PayLightningAddressAsync("bub@bub.gg", 10, maxFeeSats: 50, ct: cts.Token);
         Assert.That(paymentId, Is.Not.Empty);
         TestContext.Out.WriteLine($"External payment ID: {paymentId}");
     }
@@ -1015,28 +1016,128 @@ public class WithdrawalTests
         TestContext.Out.WriteLine($"Withdrawal fee estimate: {fee.FeeSats} sats");
     }
 
-    [Test, Explicit("Destructive: spends balance")]
-    public async Task ShouldWithdrawToOnChainAddress()
+    /// <summary>
+    /// Requests a cooperative exit from the SSP for every spendable leaf and runs exactly the
+    /// checks <c>WithdrawAsync</c> runs before it signs anything, on the real response. Nothing
+    /// is signed or handed over and the SSP request simply expires unused, so this proves the
+    /// request shape, the response fields, and the validator on mainnet without moving funds.
+    /// </summary>
+    [Test]
+    public async Task CoopExitResponseFromTheSspValidatesWithoutSigning()
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CurrentContext.CancellationToken);
         cts.CancelAfter(Timeout);
 
-        var balance = await _wallet.GetBalanceAsync(cts.Token);
-        if (balance.SatsBalance.Available <= 0)
+        var leaves = await _wallet.GetSpendableLeavesAsync(cts.Token);
+        if (leaves.Count == 0)
         {
-            Assert.Inconclusive("No balance to withdraw");
+            Assert.Inconclusive("WalletA has no spendable leaves");
             return;
         }
 
-        var withdrawAmount = balance.SatsBalance.Available / 2;
-        TestContext.Out.WriteLine($"Withdrawing {withdrawAmount} of {balance.SatsBalance.Available} sats");
+        var amount = leaves.Sum(l => l.ValueSats);
+        var leafIds = leaves.Select(l => l.Id).ToArray();
+        var destination = (await _wallet.GetStaticDepositAddressAsync(cts.Token)).Address;
+        var quote = await _wallet.GetFeeQuoteAsync(leafIds, destination, cts.Token);
+        TestContext.Out.WriteLine($"{leaves.Count} leaves, {amount} sats, SSP quote {quote.FeeSats} sats, destination {destination}");
+        if (quote.FeeSats >= amount)
+        {
+            Assert.Inconclusive($"SSP fee {quote.FeeSats} sats is not covered by {amount} spendable sats");
+            return;
+        }
 
-        var txid = await _wallet.WithdrawAsync(
-            "bc1q4cmzdldcdp43h2r7nde44rh8rcjr9vzlmvj5lq",
-            withdrawAmount, cts.Token);
+        var feeCap = CoopExitValidator.ResolveFeeCap(quote.FeeSats, null, amount);
+        var response = await _wallet.SspClient.ExecuteAsync<RequestCoopExitResponse>(
+            Mutations.RequestCoopExit,
+            new Dictionary<string, object>
+            {
+                ["leaf_external_ids"] = leafIds,
+                ["withdrawal_address"] = destination,
+                ["exit_speed"] = "FAST",
+                ["withdraw_all"] = true,
+                ["user_outbound_transfer_external_id"] = Guid.NewGuid().ToString("D"),
+            },
+            cts.Token);
+        var request = response.RequestCoopExit.Request;
+        Assert.That(request.RawCoopExitTransaction, Is.Not.Null.And.Not.Empty, "the SSP must return raw_coop_exit_transaction");
+        Assert.That(request.RawConnectorTransaction, Is.Not.Empty);
+        Assert.That(request.CoopExitTxid, Is.Not.Empty);
 
-        Assert.That(txid, Is.Not.Null.And.Not.Empty);
+        var validated = CoopExitValidator.Validate(
+            request.RawCoopExitTransaction,
+            request.RawConnectorTransaction,
+            request.CoopExitTxid,
+            destination,
+            amount - feeCap,
+            leaves.Count,
+            _client.Options.Network);
+
+        TestContext.Out.WriteLine(
+            $"exit txid {validated.ExitTxidHex} (SSP field {request.CoopExitTxid}), payout {validated.PayoutSats} sats at vout {validated.PayoutVout}, " +
+            $"connector txid {Convert.ToHexString(validated.ConnectorTxidInternal).ToLowerInvariant()} with {validated.ConnectorTx.Outputs.Count} outputs");
+        Assert.That(validated.PayoutSats, Is.GreaterThanOrEqualTo((ulong)(amount - feeCap)));
+        Assert.That(validated.ConnectorTx.Outputs.Count, Is.EqualTo(leaves.Count + 1));
+
+        // Build (but never sign) the connector refunds for the first leaf: proves the raw-tx helpers
+        // accept the SSP's real transactions and produce the two-input sighashes the exit would sign.
+        var sspPubKey = Convert.FromHexString(_client.Options.SspIdentityPublicKeyHex);
+        var connectorOutput = validated.ConnectorTx.Outputs[0];
+        var refunds = WithdrawalService.BuildConnectorRefunds(
+            leaves[0].Node, sspPubKey, validated.ConnectorTxidInternal,
+            connectorOutput.ScriptPubKey.ToBytes(), (ulong)connectorOutput.Value.Satoshi, 0,
+            FrostSigningHelper.GetNetworkString(_client.Options.Network));
+        Assert.That(refunds.Cpfp.Sighash, Has.Length.EqualTo(32));
+        Assert.That(refunds.DirectFromCpfp.Sighash, Has.Length.EqualTo(32));
+        Assert.That(NBitcoin.Transaction.Load(refunds.Cpfp.Tx, NBitcoin.Network.Main).Inputs, Has.Count.EqualTo(2));
+        TestContext.Out.WriteLine("connector refunds built for leaf " + leaves[0].Id + " (cpfp, directFromCpfp" + (refunds.Direct is null ? ")" : ", direct)"));
+    }
+
+    /// <summary>
+    /// The real thing: spends balance on-chain. Opt in with <c>NSPARK_TEST_ALLOW_WITHDRAW=1</c>.
+    /// Optional: <c>NSPARK_TEST_WITHDRAW_SATS</c> (default: every spendable sat),
+    /// <c>NSPARK_TEST_WITHDRAW_DESTINATION</c> (default: this wallet's own static deposit
+    /// address, so the payout can be claimed back with <c>ClaimStaticDepositAsync</c>),
+    /// <c>NSPARK_TEST_WITHDRAW_MAX_FEE_SATS</c> (default: the SSP's quote).
+    /// </summary>
+    [Test, Explicit("Destructive: spends balance on-chain; set NSPARK_TEST_ALLOW_WITHDRAW=1")]
+    public async Task ShouldWithdrawToOnChainAddress()
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CurrentContext.CancellationToken);
+        cts.CancelAfter(TimeSpan.FromMinutes(10));
+
+        if (TestSecrets.TryGet("NSPARK_TEST_ALLOW_WITHDRAW") != "1")
+        {
+            Assert.Inconclusive("Set NSPARK_TEST_ALLOW_WITHDRAW=1 to run the on-chain withdrawal.");
+            return;
+        }
+
+        var destination = TestSecrets.TryGet("NSPARK_TEST_WITHDRAW_DESTINATION")
+            ?? (await _wallet.GetStaticDepositAddressAsync(cts.Token)).Address;
+        var spendable = await _wallet.GetSpendableLeavesAsync(cts.Token);
+        var amount = long.TryParse(TestSecrets.TryGet("NSPARK_TEST_WITHDRAW_SATS"), out var configuredAmount)
+            ? configuredAmount
+            : spendable.Sum(l => l.ValueSats);
+        long? maxFeeSats = long.TryParse(TestSecrets.TryGet("NSPARK_TEST_WITHDRAW_MAX_FEE_SATS"), out var cap) ? cap : null;
+        if (amount <= 0)
+        {
+            Assert.Inconclusive("No spendable balance to withdraw");
+            return;
+        }
+
+        var before = await _wallet.GetBalanceAsync(cts.Token);
+        TestContext.Out.WriteLine($"Withdrawing {amount} of {before.SatsBalance.Available} available sats to {destination} (fee cap {maxFeeSats?.ToString() ?? "SSP quote"})");
+
+        var txid = await _wallet.WithdrawAsync(destination, amount, maxFeeSats, cts.Token);
+
+        Assert.That(txid, Has.Length.EqualTo(64));
         TestContext.Out.WriteLine($"Withdrawal txid: {txid}");
+
+        // The exited leaves stay transfer-locked (still owned) until the exit confirms on-chain;
+        // only the spendable balance drops immediately.
+        await Task.Delay(TimeSpan.FromSeconds(3), cts.Token);
+        var after = await _wallet.GetBalanceAsync(cts.Token);
+        Assert.That(after.SatsBalance.Available, Is.EqualTo(before.SatsBalance.Available - amount));
+        Assert.That(after.SatsBalance.Owned, Is.GreaterThanOrEqualTo(before.SatsBalance.Owned - amount));
     }
 }
 
@@ -1405,7 +1506,7 @@ public class FullFlowTests
         var invoice = await _walletB.CreateLightningInvoiceAsync(100, memo: "full flow test", ct: cts.Token);
         Assert.That(invoice.AmountSats, Is.EqualTo(100));
 
-        var payId = await _walletA.PayLightningInvoiceAsync(invoice.PaymentRequest, ct: cts.Token);
+        var payId = await _walletA.PayLightningInvoiceAsync(invoice.PaymentRequest, maxFeeSats: 50, ct: cts.Token);
         Assert.That(payId, Is.Not.Empty);
         Log($"Payment sent: {payId}");
 
@@ -1437,7 +1538,7 @@ public class FullFlowTests
 
         // --- Phase 3: External Lightning A -> bub@bub.gg ---
         Log("\n--- Phase 3: Lightning A -> bub@bub.gg (10 sats) ---");
-        var extPayId = await _walletA.PayLightningAddressAsync("bub@bub.gg", 10, ct: cts.Token);
+        var extPayId = await _walletA.PayLightningAddressAsync("bub@bub.gg", 10, maxFeeSats: 50, ct: cts.Token);
         Assert.That(extPayId, Is.Not.Empty);
         Log($"External payment: {extPayId}");
 

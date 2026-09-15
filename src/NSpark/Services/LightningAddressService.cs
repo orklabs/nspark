@@ -67,16 +67,18 @@ public static class LightningAddressService
 
     /// <summary>
     /// Pay a Lightning address (<c>user@domain</c>): resolve via LNURL-pay then pay the resulting
-    /// BOLT11 via <see cref="LightningService.PayLightningInvoiceAsync"/>.
+    /// BOLT11 via <see cref="LightningService.PayLightningInvoiceAsync"/>. The issued invoice
+    /// must carry <paramref name="amountSats"/>; the routing fee is bounded by
+    /// <paramref name="maxFeeSats"/> like any other Lightning send.
     /// </summary>
     public static async Task<string> PayLightningAddressAsync(
         this SparkWallet wallet,
         string lightningAddress,
         long amountSats,
-        long? maxFeeSats = null,
+        long maxFeeSats,
         CancellationToken ct = default)
     {
         var pr = await wallet.ResolveLightningAddressAsync(lightningAddress, amountSats, ct).ConfigureAwait(false);
-        return await wallet.PayLightningInvoiceAsync(pr, maxFeeSats, ct).ConfigureAwait(false);
+        return await wallet.PayLightningInvoiceAsync(pr, maxFeeSats, ct: ct).ConfigureAwait(false);
     }
 }

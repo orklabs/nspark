@@ -14,13 +14,20 @@ public static class SwapService
     /// <summary>
     /// Select leaves that exactly cover the target amount. If no exact match exists,
     /// triggers a leaf swap via SSP to split leaves into the required denominations.
+    /// Only spendable leaves take part (see <see cref="BalanceService.GetSpendableLeavesAsync"/>):
+    /// leaves at the timelock floor are left out instead of failing the whole operation.
     /// </summary>
     public static async Task<IReadOnlyList<SparkLeaf>> SelectLeavesWithSwapAsync(
         this SparkWallet wallet,
         long amountSats,
         CancellationToken ct = default)
     {
-        var leaves = await wallet.GetLeavesAsync(ct).ConfigureAwait(false);
+        if (amountSats <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(amountSats), amountSats, "Target amount must be positive.");
+        }
+
+        var leaves = await wallet.GetSpendableLeavesAsync(ct).ConfigureAwait(false);
 
         // First try exact selection (leaves that sum exactly to the target)
         var exact = TryExactSelection(leaves, amountSats);
@@ -41,16 +48,16 @@ public static class SwapService
 
         // Swap didn't produce exact match — should not happen, but don't overspend
         throw new InvalidOperationException(
-            $"Leaf swap did not produce exact denomination for {amountSats} sats. Available: {string.Join(", ", newLeaves.Where(l => l.Status == "AVAILABLE").Select(l => l.ValueSats))} sats.");
+            $"Leaf swap did not produce exact denomination for {amountSats} sats. Spendable: {string.Join(", ", newLeaves.Where(l => l.Status == "AVAILABLE" && l.IsSpendable).Select(l => l.ValueSats))} sats.");
     }
 
     /// <summary>
-    /// Try to find leaves that exactly sum to the target amount.
+    /// Try to find spendable leaves that exactly sum to the target amount.
     /// Returns null if no exact combination found.
     /// </summary>
     internal static IReadOnlyList<SparkLeaf>? TryExactSelection(IReadOnlyList<SparkLeaf> leaves, long amountSats)
     {
-        var available = leaves.Where(l => l.Status == "AVAILABLE").ToList();
+        var available = leaves.Where(l => l.Status == "AVAILABLE" && l.IsSpendable).ToList();
 
         // Check if single leaf matches exactly
         var single = available.FirstOrDefault(l => l.ValueSats == amountSats);
@@ -90,11 +97,11 @@ public static class SwapService
         CancellationToken ct = default)
     {
         var totalTarget = targetAmounts.Sum();
-        var leaves = await wallet.GetLeavesAsync(ct).ConfigureAwait(false);
+        var leaves = await wallet.GetSpendableLeavesAsync(ct).ConfigureAwait(false);
 
         // Select leaves covering the total target (smallest first)
         var sorted = leaves
-            .Where(l => l.Status == "AVAILABLE")
+            .Where(l => l.Status == "AVAILABLE" && l.IsSpendable)
             .OrderBy(l => l.ValueSats)
             .ToList();
         var selected = new List<SparkLeaf>();
@@ -140,8 +147,7 @@ public static class SwapService
         var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
             new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct);
         var soOperators = soListResponse.SigningOperators;
-        var soCount = (uint)soOperators.Count;
-        var threshold = (uint)Math.Max(2, (soCount + 2) / 2);
+        var threshold = wallet.Client.Options.EffectiveSigningThreshold;
 
         // Generate adaptor keypair via the signer — the adaptor private key never leaves the signer.
         var adaptorKey = await wallet.Signer.GenerateAdaptorKeyAsync(ct).ConfigureAwait(false);
@@ -364,7 +370,7 @@ public static class SwapService
 
         await ClaimService.ClaimSingleTransferAsync(
             wallet, coordinatorClient, headers, networkStr,
-            soListResponse2.SigningOperators, (uint)soListResponse2.SigningOperators.Count,
+            soListResponse2.SigningOperators,
             inboundTransfer, inboundTransfer.Leaves.ToList(), ct).ConfigureAwait(false);
 
         // Return the new leaves

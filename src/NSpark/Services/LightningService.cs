@@ -1,4 +1,5 @@
 using Google.Protobuf;
+using NSpark.Exceptions;
 using NSpark.GraphQL;
 using NSpark.Models;
 using NSpark.Proto;
@@ -6,10 +7,14 @@ using NSpark.Signer;
 
 namespace NSpark.Services;
 
-/// <inheritdoc/>
+/// <summary>
+/// Extension methods on <see cref="SparkWallet"/> for receiving and sending Lightning payments
+/// through the SSP.
+/// </summary>
 public static class LightningService
 {
-    private const uint HtlcSequence = 40;
+    private const string InvoiceOperation = "lightning.invoice";
+    private const string PayOperation = "lightning.pay";
 
     /// <summary>
     /// Create a Lightning invoice to receive a payment.
@@ -34,10 +39,18 @@ public static class LightningService
         // is derived deterministically from transferId inside the signer and never
         // crosses into the wallet's address space — the wallet receives only the
         // public payment_hash and per-SO encrypted SecretShare proto blobs.
+        if (amountSats < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(amountSats), amountSats, "amountSats must not be negative.");
+        }
+        if (expirySecs is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(expirySecs), expirySecs, "expirySecs must be positive.");
+        }
+
         var transferId = Guid.NewGuid().ToString();
         var soConfigs = wallet.Client.Options.SigningOperators;
-        var numOperators = (uint)soConfigs.Length;
-        var threshold = (uint)((numOperators + 2) / 2); // same as JS SDK
+        var threshold = wallet.Client.Options.EffectiveSigningThreshold;
 
         var preimageSoTargets = soConfigs
             .Select((cfg, i) => new SoTarget(
@@ -79,6 +92,16 @@ public static class LightningService
         var requestData = response.RequestLightningReceive.Request;
         var invoiceData = requestData.Invoice;
 
+        // The invoice we hand out must be the one we asked for: our payment hash, our amount,
+        // our network. Checked before any preimage share leaves the wallet, as the reference
+        // SDK's validateAndCreateLightningInvoice does.
+        var decodedInvoice = LightningValidator.VerifyCreatedInvoice(
+            invoiceData.EncodedInvoice,
+            invoiceData.PaymentHash,
+            paymentHash,
+            amountSats,
+            wallet.Client.Options.Network);
+
         // Step 3: Store encrypted shares with SOs
         var coordinatorAddress = soConfigs[0].Address;
         var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
@@ -106,7 +129,11 @@ public static class LightningService
             PaymentRequest: invoiceData.EncodedInvoice,
             PaymentHash: paymentHashHex,
             AmountSats: amountSats,
-            ExpiresAt: DateTimeOffset.Parse(invoiceData.ExpiresAt, System.Globalization.CultureInfo.InvariantCulture),
+            ExpiresAt: DateTimeOffset.TryParse(
+                invoiceData.ExpiresAt, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal, out var expiresAt)
+                ? expiresAt
+                : decodedInvoice.ExpiresAt,
             RequestId: requestData.Id);
     }
 
@@ -260,46 +287,112 @@ public static class LightningService
     private const ulong DefaultFeeSats = SparkConstants.DefaultRefundFeeSats;
 
     /// <summary>
-    /// Pay a Lightning invoice via the v3 preimage swap flow.
-    /// Matches the JS reference SDK: prepareTransferForLightning + swapNodesForPreimage + SSP send.
+    /// Pay a BOLT-11 invoice through the SSP with the v3 preimage-swap flow (the reference
+    /// SDK's <c>payLightningInvoice</c>: <c>prepareTransferForLightning</c> +
+    /// <c>swapNodesForPreimage</c> + <c>requestLightningSend</c>).
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The invoice is decoded with a BOLT-11 parser that verifies the bech32 checksum and
+    /// enforces the wallet's network. The SSP's fee estimate is fetched first and the payment is
+    /// refused with <see cref="FeeExceedsLimitException"/> if it is above
+    /// <paramref name="maxFeeSats"/>; only then are leaves selected and locked.
+    /// </para>
+    /// <para>
+    /// Once <c>initiate_preimage_swap_v3</c> succeeds the coordinator holds the leaves for the
+    /// transfer. If the SSP then cannot be asked to pay, the call throws
+    /// <see cref="SparkLightningSendIncompleteException"/> carrying that transfer id: call again
+    /// with the same invoice and <paramref name="transferId"/> to resume (the coordinator
+    /// returns the transfer it already holds instead of locking more leaves), or reconcile
+    /// through the SSP with the payment hash.
+    /// </para>
+    /// </remarks>
+    /// <param name="wallet">The Spark wallet.</param>
+    /// <param name="paymentRequest">BOLT-11 invoice. Must be for the wallet's network.</param>
+    /// <param name="maxFeeSats">
+    /// Highest routing fee the caller accepts. Lightning routing fees are not bounded by the
+    /// protocol, only by what the wallet is willing to pay, so this is required.
+    /// </param>
+    /// <param name="amountSats">
+    /// Amount to pay for an amountless (zero-amount) invoice. Must be omitted, or equal to the
+    /// invoice amount, for an invoice that carries an amount.
+    /// </param>
+    /// <param name="transferId">
+    /// Optional UUID that makes the send resumable. On
+    /// <see cref="SparkLightningSendIncompleteException"/> call again with the same id. It is
+    /// also sent to the coordinator as the idempotency key, so a retry after a partial failure
+    /// resumes the existing swap instead of starting a second one.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The SSP-side Lightning send request id, for status queries and reconciliation.</returns>
     public static async Task<string> PayLightningInvoiceAsync(
         this SparkWallet wallet,
         string paymentRequest,
-        long? maxFeeSats = null,
+        long maxFeeSats,
+        long? amountSats = null,
+        string? transferId = null,
         CancellationToken ct = default)
     {
-        var paymentHash = Bolt11Decoder.GetPaymentHash(paymentRequest);
-        var amountSats = Bolt11Decoder.GetAmountSats(paymentRequest);
-
-        // Get fee estimate from SSP
-        var feeEstimate = await wallet.GetLightningSendFeeEstimateAsync(paymentRequest, ct: ct).ConfigureAwait(false);
-        if (maxFeeSats.HasValue && maxFeeSats.Value < feeEstimate)
+        ArgumentNullException.ThrowIfNull(wallet);
+        ArgumentException.ThrowIfNullOrWhiteSpace(paymentRequest);
+        if (maxFeeSats < 0)
         {
-            throw new InvalidOperationException(
-                $"maxFeeSats ({maxFeeSats.Value}) does not cover fee estimate ({feeEstimate} sats).");
+            throw new ArgumentOutOfRangeException(nameof(maxFeeSats), maxFeeSats, "maxFeeSats must not be negative.");
         }
 
-        var feeSats = (ulong)Math.Max(feeEstimate, 1);
+        var options = wallet.Client.Options;
+        var invoice = Bolt11Invoice.Decode(paymentRequest);
+        if (!invoice.BelongsTo(options.Network))
+        {
+            throw new InvalidBolt11Exception(
+                PayOperation, $"The invoice is for {invoice.Network}; the wallet is on {options.Network}.")
+            {
+                PaymentRequest = paymentRequest,
+            };
+        }
 
-        var coordinatorAddress = wallet.Client.Options.SigningOperatorAddresses[0];
+        var paymentHash = invoice.PaymentHash;
+        var isAmountless = invoice.AmountMsat is null;
+        var invoiceAmountSats = LightningValidator.ResolvePaymentAmountSats(invoice.AmountMsat, amountSats);
+        var resumeTransferId = LightningValidator.NormalizeTransferId(transferId);
+
+        // Fee estimate from the SSP; refuse anything above the caller's cap before any leaf moves.
+        var feeEstimate = await wallet.GetLightningSendFeeEstimateAsync(
+            paymentRequest, isAmountless ? invoiceAmountSats : null, ct).ConfigureAwait(false);
+        var feeSats = Math.Max(feeEstimate, 1);
+        if (feeSats > maxFeeSats)
+        {
+            throw new FeeExceedsLimitException(PayOperation, feeSats, maxFeeSats);
+        }
+
+        long totalNeeded;
+        try
+        {
+            totalNeeded = checked(invoiceAmountSats + feeSats);
+        }
+        catch (OverflowException ex)
+        {
+            throw new ArgumentException("Amount plus fee overflows.", nameof(amountSats), ex);
+        }
+
+        var coordinatorAddress = options.SigningOperatorAddresses[0];
         var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
         var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
-        var networkStr = FrostSigningHelper.GetNetworkString(wallet.Client.Options.Network);
+        var networkStr = FrostSigningHelper.GetNetworkString(options.Network);
 
         // Step 1: Select leaves covering invoice amount + fee (exact match or swap)
-        var selectedLeaves = await wallet.SelectLeavesWithSwapAsync(amountSats + (long)feeSats, ct).ConfigureAwait(false);
+        var selectedLeaves = await wallet.SelectLeavesWithSwapAsync(totalNeeded, ct).ConfigureAwait(false);
         var leafIds = selectedLeaves.Select(l => l.Id).ToList();
 
         // Step 2: Get SO operator info
         var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
-            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct);
+            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct).ConfigureAwait(false);
         var soOperators = soListResponse.SigningOperators;
-        var soCount = (uint)soOperators.Count;
 
-        var sspPubKey = Convert.FromHexString(wallet.Client.Options.SspIdentityPublicKeyHex);
+        var sspPubKey = Convert.FromHexString(options.SspIdentityPublicKeyHex);
         var senderPubKey = wallet.IdentityPublicKey;
-        var transferId = Guid.NewGuid().ToString();
+        var swapTransferId = resumeTransferId ?? Guid.NewGuid().ToString("D");
+        // Single shared expiry time: 16 days from now (matching the reference SDK)
         var expiryTime = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(
             DateTimeOffset.UtcNow.AddDays(16));
 
@@ -307,13 +400,12 @@ public static class LightningService
 
         // Step 3-4: Build encrypted per-SO tweak packages via the signer. All share material
         // stays inside the signer's trust boundary; the wallet only sees the encrypted blobs.
-        var threshold = (uint)Math.Max(2, (soCount + 2) / 2);
-        var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, wallet.Client.Options.SigningOperators);
+        var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, options.SigningOperators);
         var leafDescriptors = selectedLeaves
             .Select(l => new SendTweakLeafDescriptor(l.Id, sspPubKey))
             .ToList();
         var encryptedBatch = await wallet.Signer.BuildEncryptedSendTweaksAsync(
-            leafDescriptors, soTargets, transferId, threshold, ct).ConfigureAwait(false);
+            leafDescriptors, soTargets, swapTransferId, options.EffectiveSigningThreshold, ct).ConfigureAwait(false);
 
         var keyTweakPackage = new Dictionary<string, ByteString>(encryptedBatch.EncryptedPackageBySoId.Count);
         foreach (var (soId, blob) in encryptedBatch.EncryptedPackageBySoId)
@@ -325,8 +417,13 @@ public static class LightningService
         var htlcCommitmentsReq = new GetSigningCommitmentsRequest { Count = 3 };
         htlcCommitmentsReq.NodeIds.AddRange(leafIds);
         var htlcCommitmentsResp = await coordinatorClient.get_signing_commitmentsAsync(
-            htlcCommitmentsReq, headers, cancellationToken: ct);
+            htlcCommitmentsReq, headers, cancellationToken: ct).ConfigureAwait(false);
         var htlcCommitments = htlcCommitmentsResp.SigningCommitments.ToList();
+        if (htlcCommitments.Count < 3 * selectedLeaves.Count)
+        {
+            throw new PaymentFailedException(
+                PayOperation, $"Got {htlcCommitments.Count} signing commitments, need {3 * selectedLeaves.Count}.");
+        }
 
         // Step 6: Build and sign HTLC refund txs (signRefundsForLightning)
         var htlcCpfpJobs = new List<UserSignedTxSigningJob>();
@@ -345,7 +442,7 @@ public static class LightningService
                 ? node.RefundTx.ToByteArray()
                 : nodeTxBytes;
             var (cpfpSeq, _) = TimelockHelper.ComputeNextSequences(
-                refundTxBytes, "lightning.pay", leaf.Id);
+                refundTxBytes, PayOperation, leaf.Id);
             var bit30 = cpfpSeq & (1u << 30);
             var nextTimelock = cpfpSeq & 0xFFFF;
             var htlcSeq = bit30 | (nextTimelock + HtlcTimelockOffset);
@@ -390,7 +487,7 @@ public static class LightningService
             htlcDirectFromCpfpJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
                 wallet.Signer, node.Id, verifyingKey,
                 directFromCpfpHtlc.Tx, directFromCpfpHtlc.Sighash,
-                htlcCommitments[i + 2 * selectedLeaves.Count].SigningNonceCommitments, ct)
+                htlcCommitments[i + (2 * selectedLeaves.Count)].SigningNonceCommitments, ct)
                 .ConfigureAwait(false));
         }
 
@@ -400,28 +497,16 @@ public static class LightningService
             UserSignature = ByteString.Empty, // signed below
             HashVariant = HashVariant.V2,
         };
-        foreach (var job in htlcCpfpJobs)
-        {
-            transferPackage.LeavesToSend.Add(job);
-        }
-
-        foreach (var job in htlcDirectJobs)
-        {
-            transferPackage.DirectLeavesToSend.Add(job);
-        }
-
-        foreach (var job in htlcDirectFromCpfpJobs)
-        {
-            transferPackage.DirectFromCpfpLeavesToSend.Add(job);
-        }
-
+        transferPackage.LeavesToSend.AddRange(htlcCpfpJobs);
+        transferPackage.DirectLeavesToSend.AddRange(htlcDirectJobs);
+        transferPackage.DirectFromCpfpLeavesToSend.AddRange(htlcDirectFromCpfpJobs);
         foreach (var (soId, cipher) in keyTweakPackage)
         {
             transferPackage.KeyTweakPackage.Add(soId, cipher);
         }
 
         // Sign the transfer package
-        var transferIdBytes = Convert.FromHexString(transferId.Replace("-", ""));
+        var transferIdBytes = Convert.FromHexString(swapTransferId.Replace("-", "", StringComparison.Ordinal));
         var packageHash = SparkTaggedHash.Create("spark", "transfer", "signing payload")
             .AddBytes(transferIdBytes)
             .AddMapStringToBytes(keyTweakPackage)
@@ -429,258 +514,87 @@ public static class LightningService
         transferPackage.UserSignature = ByteString.CopyFrom(
             await wallet.Signer.SignWithIdentityKeyAsync(packageHash, ct).ConfigureAwait(false));
 
-        // Step 8: Build StartTransferRequest with TransferPackage + leaves_to_send
+        // Step 8: StartTransferRequest carrying the TransferPackage. The reference SDK leaves
+        // leaves_to_send empty and does not populate the legacy `transfer` field of the swap
+        // request: the coordinator reads everything from transfer_request.transfer_package.
         var startTransferRequest = new StartTransferRequest
         {
-            TransferId = transferId,
+            TransferId = swapTransferId,
             OwnerIdentityPublicKey = ByteString.CopyFrom(senderPubKey),
             ReceiverIdentityPublicKey = ByteString.CopyFrom(sspPubKey),
             ExpiryTime = expiryTime,
             TransferPackage = transferPackage,
         };
 
-        // The server reads HTLC refund txs from leaves_to_send (LeafRefundTxSigningJob)
-        for (int i = 0; i < selectedLeaves.Count; i++)
+        // Step 9: initiate_preimage_swap_v3. The transfer id doubles as the coordinator
+        // idempotency key, so a retry after a partial failure resumes the existing swap.
+        var swapHeaders = new Grpc.Core.Metadata();
+        foreach (var entry in headers)
         {
-            var leafRefundJob = new LeafRefundTxSigningJob
-            {
-                LeafId = htlcCpfpJobs[i].LeafId,
-                RefundTxSigningJob = ToSigningJob(htlcCpfpJobs[i]),
-                DirectFromCpfpRefundTxSigningJob = ToSigningJob(htlcDirectFromCpfpJobs[i]),
-            };
-            if (i < htlcDirectJobs.Count)
-            {
-                leafRefundJob.DirectRefundTxSigningJob = ToSigningJob(htlcDirectJobs[i]);
-            }
-
-            startTransferRequest.LeavesToSend.Add(leafRefundJob);
+            swapHeaders.Add(entry);
         }
+        swapHeaders.Add("x-idempotency-key", swapTransferId);
 
-        // ── swapNodesForPreimage: normal refund txs + initiate_preimage_swap_v3 ──
-
-        // Step 9: Get signing commitments for normal refund txs (Count=3)
-        var swapCommitmentsReq = new GetSigningCommitmentsRequest { Count = 3 };
-        swapCommitmentsReq.NodeIds.AddRange(leafIds);
-        var swapCommitmentsResp = await coordinatorClient.get_signing_commitmentsAsync(
-            swapCommitmentsReq, headers, cancellationToken: ct);
-        var swapCommitments = swapCommitmentsResp.SigningCommitments.ToList();
-
-        // Step 10: Build and sign normal decremented-timelock refund txs (signRefunds)
-        var swapCpfpJobs = new List<UserSignedTxSigningJob>();
-
-        for (int i = 0; i < selectedLeaves.Count; i++)
-        {
-            var leaf = selectedLeaves[i];
-            var node = leaf.Node;
-            var verifyingKey = node.VerifyingPublicKey.ToByteArray();
-            var nodeTxBytes = node.NodeTx.ToByteArray();
-            var directNodeTx = node.DirectTx.Length > 0 ? node.DirectTx.ToByteArray() : null;
-
-            // Read current sequence and compute decremented sequences
-            var refundTxBytes = node.RefundTx.Length > 0
-                ? node.RefundTx.ToByteArray()
-                : nodeTxBytes;
-            var (normalSeq, normalDirectSeq) = TimelockHelper.ComputeNextSequences(
-                refundTxBytes, "lightning.pay", leaf.Id);
-
-            var refundTrio = SparkTxBuilder.BuildRefundTxTrio(
-                cpfpNodeTx: nodeTxBytes,
-                directNodeTx: directNodeTx,
-                vout: 0,
-                receivingPublicKey: sspPubKey,
-                network: networkStr,
-                sequence: normalSeq,
-                directSequence: normalDirectSeq,
-                // Only the cpfp refund is submitted in this swap path, but value must still
-                // match SSP expectation.
-                feeSats: SparkConstants.DefaultRefundFeeSats);
-
-            // Only cpfp goes into transfer.leavesToSend (direct/directFromCpfp omitted per ref SDK)
-            swapCpfpJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
-                wallet.Signer, node.Id, verifyingKey,
-                refundTrio.CpfpRefund.Tx, refundTrio.CpfpRefund.Sighash,
-                swapCommitments[i].SigningNonceCommitments, ct)
-                .ConfigureAwait(false));
-        }
-
-        // Step 11: Build StartUserSignedTransferRequest (cpfp only)
-        var swapTransfer = new StartUserSignedTransferRequest
-        {
-            TransferId = transferId,
-            OwnerIdentityPublicKey = ByteString.CopyFrom(senderPubKey),
-            ReceiverIdentityPublicKey = ByteString.CopyFrom(sspPubKey),
-            ExpiryTime = expiryTime,
-        };
-        foreach (var job in swapCpfpJobs)
-        {
-            swapTransfer.LeavesToSend.Add(job);
-        }
-
-        // Step 12: Call initiate_preimage_swap_v3 with both transfer + transferRequest
         var swapResponse = await coordinatorClient.initiate_preimage_swap_v3Async(
             new InitiatePreimageSwapRequest
             {
                 PaymentHash = ByteString.CopyFrom(paymentHash),
                 InvoiceAmount = new InvoiceAmount
                 {
-                    ValueSats = (ulong)amountSats,
+                    ValueSats = (ulong)invoiceAmountSats,
                     InvoiceAmountProof = new InvoiceAmountProof
                     {
                         Bolt11Invoice = paymentRequest,
                     },
                 },
                 Reason = InitiatePreimageSwapRequest.Types.Reason.Send,
-                Transfer = swapTransfer,
                 ReceiverIdentityPublicKey = ByteString.CopyFrom(sspPubKey),
-                FeeSats = feeSats,
+                FeeSats = (ulong)feeSats,
                 TransferRequest = startTransferRequest,
             },
-            headers,
-            cancellationToken: ct);
+            swapHeaders,
+            cancellationToken: ct).ConfigureAwait(false);
+        if (swapResponse.Transfer is null)
+        {
+            throw new PaymentFailedException(PayOperation, "initiate_preimage_swap_v3 returned no transfer.");
+        }
 
-        // Step 13: Call SSP to initiate the Lightning send with the transfer ID
+        // Step 10: Ask the SSP to pay, naming the transfer that holds the leaves. From here on
+        // the coordinator holds the leaves for this transfer: surface the transfer id on failure
+        // so the app can resume (same transferId) or reconcile via the SSP.
         var variables = new Dictionary<string, object?>
         {
             ["encoded_invoice"] = paymentRequest,
+            ["amount_sats"] = isAmountless ? invoiceAmountSats : null,
             ["user_outbound_transfer_external_id"] = swapResponse.Transfer.Id,
         };
 
-        var sspResponse = await wallet.SspClient.ExecuteAsync<RequestLightningSendResponse>(
-            Mutations.RequestLightningSend, variables, ct).ConfigureAwait(false);
-
-        return sspResponse.RequestLightningSend.Request.Id;
-    }
-
-    /// <summary>
-    /// Minimal BOLT11 invoice decoder — extracts only payment hash and amount.
-    /// </summary>
-    internal static class Bolt11Decoder
-    {
-        private const string Bech32Charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-
-        public static byte[] GetPaymentHash(string invoice)
+        RequestLightningSendResponse sspResponse;
+        try
         {
-            var (_, dataGroups) = SplitInvoice(invoice);
-
-            // Skip timestamp (7 groups)
-            int offset = 7;
-
-            while (offset + 3 <= dataGroups.Length)
-            {
-                int type = dataGroups[offset];
-                int dataLen = (dataGroups[offset + 1] << 5) | dataGroups[offset + 2];
-                offset += 3;
-
-                if (type == 1) // payment hash tag
-                {
-                    return ConvertBits(dataGroups, offset, dataLen);
-                }
-
-                offset += dataLen;
-            }
-
-            throw new InvalidOperationException("Payment hash not found in BOLT11 invoice.");
+            sspResponse = await wallet.SspClient.ExecuteAsync<RequestLightningSendResponse>(
+                Mutations.RequestLightningSend, variables, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw new SparkLightningSendIncompleteException(
+                PayOperation,
+                $"The coordinator holds the leaves for transfer {swapResponse.Transfer.Id} but the SSP could not be asked to pay: {ex.Message}",
+                swapResponse.Transfer.Id,
+                invoice.PaymentHashHex,
+                ex);
         }
 
-        public static long GetAmountSats(string invoice)
+        var requestId = sspResponse.RequestLightningSend?.Request?.Id;
+        if (string.IsNullOrEmpty(requestId))
         {
-            var lower = invoice.ToLowerInvariant();
-            var separatorIdx = lower.LastIndexOf('1');
-            var hrp = lower[..separatorIdx];
-
-            // Strip ln + network prefix
-            string amountStr;
-            if (hrp.StartsWith("lnbcrt", StringComparison.Ordinal))
-            {
-                amountStr = hrp[6..];
-            }
-            else if (hrp.StartsWith("lnbc", StringComparison.Ordinal))
-            {
-                amountStr = hrp[4..];
-            }
-            else if (hrp.StartsWith("lntb", StringComparison.Ordinal))
-            {
-                amountStr = hrp[4..];
-            }
-            else
-            {
-                throw new InvalidOperationException($"Unknown BOLT11 network prefix: {hrp}");
-            }
-
-            if (string.IsNullOrEmpty(amountStr))
-            {
-                throw new InvalidOperationException("BOLT11 invoice has no amount.");
-            }
-
-            // Parse amount: digits + optional multiplier (m/u/n/p)
-            char last = amountStr[^1];
-            if (char.IsDigit(last))
-            {
-                return (long)(decimal.Parse(amountStr, System.Globalization.CultureInfo.InvariantCulture) * 100_000_000m);
-            }
-
-            var value = decimal.Parse(amountStr[..^1], System.Globalization.CultureInfo.InvariantCulture);
-            var btcAmount = value * last switch
-            {
-                'm' => 0.001m,
-                'u' => 0.000_001m,
-                'n' => 0.000_000_001m,
-                'p' => 0.000_000_000_001m,
-                _ => throw new InvalidOperationException($"Unknown BOLT11 multiplier: {last}"),
-            };
-
-            return (long)(btcAmount * 100_000_000m);
+            throw new SparkLightningSendIncompleteException(
+                PayOperation,
+                $"The coordinator holds the leaves for transfer {swapResponse.Transfer.Id} but the SSP returned no Lightning send request id.",
+                swapResponse.Transfer.Id,
+                invoice.PaymentHashHex);
         }
 
-        private static (string hrp, int[] dataGroups) SplitInvoice(string invoice)
-        {
-            var lower = invoice.ToLowerInvariant();
-            var separatorIdx = lower.LastIndexOf('1');
-            var hrp = lower[..separatorIdx];
-            var dataStr = lower[(separatorIdx + 1)..^6]; // strip 6-char bech32 checksum
-
-            var groups = new int[dataStr.Length];
-            for (int i = 0; i < dataStr.Length; i++)
-            {
-                groups[i] = Bech32Charset.IndexOf(dataStr[i]);
-            }
-
-            return (hrp, groups);
-        }
-
-        /// <summary>
-        /// Convert 5-bit groups to 8-bit bytes (bech32 → raw bytes).
-        /// </summary>
-        private static byte[] ConvertBits(int[] data, int offset, int length)
-        {
-            int acc = 0, bits = 0;
-            var result = new List<byte>();
-
-            for (int i = 0; i < length; i++)
-            {
-                acc = (acc << 5) | data[offset + i];
-                bits += 5;
-                while (bits >= 8)
-                {
-                    bits -= 8;
-                    result.Add((byte)((acc >> bits) & 0xFF));
-                }
-            }
-
-            return result.ToArray();
-        }
-    }
-
-    /// <summary>
-    /// Extract SigningJob (subset) from a UserSignedTxSigningJob for LeafRefundTxSigningJob.
-    /// </summary>
-    private static Proto.SigningJob ToSigningJob(UserSignedTxSigningJob userJob)
-    {
-        return new Proto.SigningJob
-        {
-            SigningPublicKey = userJob.SigningPublicKey,
-            RawTx = userJob.RawTx,
-            SigningNonceCommitment = userJob.SigningNonceCommitment,
-        };
+        return requestId;
     }
 }

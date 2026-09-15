@@ -45,7 +45,6 @@ public static class ClaimService
         var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
             new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct);
         var soOperators = soListResponse.SigningOperators;
-        var soCount = (uint)soOperators.Count;
 
         // Process each pending transfer
         foreach (var transfer in pendingResponse.Transfers)
@@ -60,12 +59,17 @@ public static class ClaimService
             {
                 var result = await ClaimSingleTransferAsync(
                     wallet, coordinatorClient, headers, networkStr,
-                    soOperators, soCount, transfer, transferLeaves, ct).ConfigureAwait(false);
+                    soOperators, transfer, transferLeaves, ct).ConfigureAwait(false);
                 claimed.Add(result);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {
-                // Skip transfers that fail (e.g. corrupted state from previous attempts)
+                // Skip transfers that fail (a transfer that fails sender-signature verification,
+                // or corrupted state from previous attempts); the rest are still claimed.
             }
         }
 
@@ -78,11 +82,14 @@ public static class ClaimService
         Grpc.Core.Metadata headers,
         string networkStr,
         Google.Protobuf.Collections.MapField<string, SigningOperatorInfo> soOperators,
-        uint soCount,
         Transfer transfer,
         List<TransferLeaf> transferLeaves,
         CancellationToken ct)
     {
+        // The sender's signature on every leaf is verified first; a transfer that fails
+        // verification is refused before any secret is decrypted or any refund is signed.
+        TransferLeafVerifier.Verify(transfer, wallet.IdentityPublicKey);
+
         // Step 3: Get signing commitments (Count=3: cpfp, direct, directFromCpfp)
         var commitmentsRequest = new GetSigningCommitmentsRequest
         {
@@ -97,7 +104,7 @@ public static class ClaimService
         // The signer ECIES-decrypts each leaf's senderSecretCipher, derives the receiver's
         // new per-leaf key, VSS-splits the tweak, and ECIES-encrypts each SO's package —
         // no plaintext share material crosses the wallet boundary.
-        var threshold = (uint)Math.Max(2, (soCount + 2) / 2);
+        var threshold = wallet.Client.Options.EffectiveSigningThreshold;
         var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, wallet.Client.Options.SigningOperators);
         var claimDescriptors = transferLeaves
             .Select(tl => new NSpark.Signer.ClaimTweakLeafDescriptor(

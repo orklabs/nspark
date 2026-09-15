@@ -60,9 +60,20 @@ Rules that matter:
 
 Spark leaves age: each transfer decrements the refund timelock by 100 blocks.
 Below **200** a leaf needs renewal; at or below **100** the coordinator
-refuses to move it at all — sends, swaps, and withdrawals of those sats throw
-`SparkLeafTimelockExhaustedException` until it is renewed. Inspect a leaf's
-remaining margin with `SparkLeaf.RefundTimelockBlocks`.
+refuses to move it at all. Inspect a leaf's remaining margin with
+`SparkLeaf.RefundTimelockBlocks`, or the two derived flags:
+
+- `SparkLeaf.IsSpendable` — above the floor; every spend path selects only
+  from these.
+- `SparkLeaf.IsRenewable` — refund timelock in `[100, 200)`, the range the
+  coordinator will renew.
+
+Spend paths renew automatically: `GetSpendableLeavesAsync()` renews the
+renewable leaves first, then excludes whatever is still at the floor, so one
+stuck leaf never fails a send other leaves could cover. Those sats show up
+as `SatsBalance.Frozen` rather than `Available`. Leaves below 100 stay
+frozen: the coordinator will not renew them either, and only a unilateral
+exit recovers them.
 
 ```csharp
 var result = await wallet.RenewExhaustedLeavesAsync();
