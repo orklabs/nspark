@@ -185,6 +185,12 @@ public class TokenLifecycleTests
         TestContext.Out.WriteLine("\n--- Phase 3: Transfer 5,000 NSPK A -> B ---");
         UInt128 transferAmount = 5_000;
         var sparkAddressB = _walletB.GetSparkAddress();
+
+        // B may still hold NSPK from an earlier (interrupted) run: assert the round trip
+        // relative to that starting balance rather than assuming B starts empty.
+        var balancesBBefore = await _walletB.GetTokenBalancesAsync(cts.Token);
+        var bBefore = balancesBBefore.FirstOrDefault(b => b.TokenMetadata.TokenIdentifier == tokenIdentifier)?.OwnedBalance ?? UInt128.Zero;
+        TestContext.Out.WriteLine($"WalletB NSPK balance before: {bBefore}");
         var transferTx = await _walletA.TransferTokensAsync(
             tokenIdentifier, transferAmount, sparkAddressB, ct: cts.Token);
         Assert.That(transferTx.TransactionHash, Is.Not.Empty);
@@ -195,7 +201,7 @@ public class TokenLifecycleTests
         var bForToken = balancesB.FirstOrDefault(b => b.TokenMetadata.TokenIdentifier == tokenIdentifier);
         TestContext.Out.WriteLine($"WalletB NSPK balance: {bForToken?.OwnedBalance ?? UInt128.Zero}");
         Assert.That(bForToken, Is.Not.Null);
-        Assert.That(bForToken!.OwnedBalance, Is.GreaterThanOrEqualTo(transferAmount));
+        Assert.That(bForToken!.OwnedBalance, Is.EqualTo(bBefore + transferAmount));
 
         var balancesA2 = await _walletA.GetTokenBalancesAsync(cts.Token);
         var a2ForToken = balancesA2.FirstOrDefault(b => b.TokenMetadata.TokenIdentifier == tokenIdentifier);
@@ -215,8 +221,8 @@ public class TokenLifecycleTests
         TestContext.Out.WriteLine(
             $"WalletB final NSPK balance: {finalBForToken?.OwnedBalance ?? UInt128.Zero}");
         Assert.That(
-            finalBForToken is null || finalBForToken.OwnedBalance == UInt128.Zero,
-            $"Expected WalletB to have zero NSPK, got {finalBForToken?.OwnedBalance}");
+            (finalBForToken?.OwnedBalance ?? UInt128.Zero) == bBefore,
+            $"Expected WalletB to be back at {bBefore} NSPK, got {finalBForToken?.OwnedBalance}");
 
         var finalA = await _walletA.GetTokenBalancesAsync(cts.Token);
         var finalAForToken = finalA.FirstOrDefault(b => b.TokenMetadata.TokenIdentifier == tokenIdentifier);

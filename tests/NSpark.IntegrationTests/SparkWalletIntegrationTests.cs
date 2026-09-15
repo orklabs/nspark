@@ -817,10 +817,28 @@ public class SwapTests
     [OneTimeTearDown]
     public void Teardown() => _client?.Dispose();
 
+    /// <summary>
+    /// A node whose refund transaction carries a fresh timelock, so the leaf counts as
+    /// spendable. Selection ignores leaves at the timelock floor (and leaves without a
+    /// parseable refund transaction), so a bare <c>TreeNode</c> would never be picked.
+    /// </summary>
+    private static NSpark.Proto.TreeNode SpendableNode()
+    {
+        var tx = new byte[4 + 1 + 36 + 1 + 4];
+        tx[0] = 0x02; // version
+        tx[4] = 0x01; // one input; prevout, empty script
+        BitConverter.GetBytes(2000u).CopyTo(tx, 42); // nSequence = initial timelock
+        return new NSpark.Proto.TreeNode
+        {
+            NodeTx = Google.Protobuf.ByteString.CopyFrom(tx),
+            RefundTx = Google.Protobuf.ByteString.CopyFrom(tx),
+        };
+    }
+
     [Test]
     public void TryExactSelection_SingleLeafMatch()
     {
-        var node = new NSpark.Proto.TreeNode();
+        var node = SpendableNode();
         var leaves = new List<SparkLeaf>
         {
             new("a", "t1", 100, "AVAILABLE") { Node = node },
@@ -836,7 +854,7 @@ public class SwapTests
     [Test]
     public void TryExactSelection_MultiLeafMatch()
     {
-        var node = new NSpark.Proto.TreeNode();
+        var node = SpendableNode();
         var leaves = new List<SparkLeaf>
         {
             new("a", "t1", 100, "AVAILABLE") { Node = node },
@@ -852,7 +870,7 @@ public class SwapTests
     [Test]
     public void TryExactSelection_NoMatch()
     {
-        var node = new NSpark.Proto.TreeNode();
+        var node = SpendableNode();
         var leaves = new List<SparkLeaf>
         {
             new("a", "t1", 100, "AVAILABLE") { Node = node },
@@ -865,7 +883,7 @@ public class SwapTests
     [Test]
     public void TryExactSelection_SkipsNonAvailable()
     {
-        var node = new NSpark.Proto.TreeNode();
+        var node = SpendableNode();
         var leaves = new List<SparkLeaf>
         {
             new("a", "t1", 200, "LOCKED") { Node = node },

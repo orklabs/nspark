@@ -10,6 +10,25 @@ will be reflected here.
 
 ## [Unreleased]
 
+### Changed
+- Dependencies bumped to the latest stable releases: Microsoft.Extensions.* 10.0.12,
+  Google.Protobuf 3.36.1, Grpc.Net.Client / Grpc.Net.ClientFactory 2.83.0, Grpc.Tools
+  2.84.0, NBitcoin 10.0.10, Polly 8.8.0, MinVer 8.0.0,
+  Microsoft.CodeAnalysis.PublicApiAnalyzers 5.6.0, and the test stack
+  (Microsoft.NET.Test.Sdk 18.10.1, NUnit 4.6.1, NUnit3TestAdapter 6.3.0,
+  NUnit.Analyzers 4.15.0, coverlet.collector 10.0.1, FluentAssertions 7.2.2,
+  BenchmarkDotNet 0.15.8). FluentAssertions stays on the 7.x line because 8.x moved to
+  a paid license for commercial use. Consumers on .NET 8 receive the
+  Microsoft.Extensions 10.0.x packages transitively; those still ship net8.0 assets.
+- GitHub Actions bumped to their current majors (checkout v7, setup-dotnet v6,
+  upload-artifact v7, download-artifact v8, codecov-action v7, action-gh-release v3,
+  attest-build-provenance v4, codeql-action v4), which clears the Node 20 deprecation
+  warnings on every workflow run.
+- Integration tests: the token lifecycle asserts the A→B→A round trip relative to B's
+  starting balance instead of assuming B starts empty, and the pure leaf-selection
+  tests build leaves with a fresh refund timelock now that selection skips leaves at
+  the floor.
+
 ## [0.2.0-alpha.4] - 2026-09-15
 
 Ports the Swift SDK 0.2.0 / 0.2.1 hardening (September 2026), re-verifies each flow
