@@ -59,10 +59,17 @@ NSpark assumes:
 - The **configured Signing Operators** are honest-but-curious. NSpark
   protects against a minority of operators going rogue via FROST threshold
   signing; key extraction by a colluding majority is out of scope.
-- The **configured SSP** is honest-but-curious. Description hashes are
-  validated; routing-fee griefing is mitigated by `MaxFeeSats` enforcement.
-- The **host's clock** is within reasonable tolerance of the network's clock
-  (see `ServerTimeSync`).
+- The **configured SSP** is honest-but-curious. Its answers are verified
+  before the wallet signs or hands anything out (invoices it creates,
+  cooperative exits, fee units), and routing-fee griefing is bounded by the
+  required `maxFeeSats`.
+- The **coordinator** is checked where it could redirect funds: deposit
+  addresses must carry the operators' proof of possession and signatures,
+  its operator list must match the configuration, and token transactions
+  must be the ones the wallet signed.
+
+The host's clock is not trusted for protocol time: token expiry and token
+timestamps follow the operators' clock (`ServerTimeSync`).
 
 These assumptions are restated in detail in
 [`docs/trust-model.md`](docs/trust-model.md). Any report that does not

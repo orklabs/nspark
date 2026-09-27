@@ -12,8 +12,12 @@ NSpark is a **non-custodial** Lightning SDK that trusts:
 1. The **host process** to be honest (memory, files, network).
 2. A **majority** of the configured Signing Operators (SOs) to be honest.
 3. The **configured SSP** to be honest-but-curious (i.e. routes payments
-   correctly but may attempt to learn the wallet's metadata).
-4. The host's **clock** to be within reasonable tolerance of network time.
+   correctly but may attempt to learn the wallet's metadata). Every SSP
+   answer the wallet signs or hands out is checked first (see below).
+
+The host's clock is not trusted for protocol time: session-token expiry and
+token-transaction timestamps use the operators' clock, estimated from the
+`date` and `x-processing-time-ms` headers of their answers.
 
 NSpark does **not** custody funds; keys are derived locally from a BIP-39
 mnemonic (or a custom `ISparkSigner`) and only signatures and ECIES-
@@ -23,7 +27,9 @@ encrypted shares leave the process.
 
 The default `SparkOptions` ship with hardcoded mainnet endpoints. These are
 **trusted by configuration**. Override them via `SparkOptions.SigningOperators`
-and `SparkOptions.SspUrl` if your deployment requires different operators.
+and `SparkOptions.SspUrl` (with `SparkOptions.SspIdentityPublicKeyHex`) if
+your deployment requires different operators or another SSP. On mainnet the
+operators are reached over TLS only.
 
 ### Default Signing Operators (mainnet)
 
@@ -48,8 +54,13 @@ inbound payments. It **does not custody funds** — every payment is HTLC-
 secured — but it can:
 
 - Refuse to forward a payment (denial of service).
-- Charge above-market fees (mitigated by `maxFeeSats`).
+- Charge above-market fees (bounded by the required `maxFeeSats` on
+  Lightning sends and by the fee quote, or `maxFeeSats`, on withdrawals).
 - Observe payment metadata (amount, destination node, timing).
+
+The SSP's identity key comes with its URL: the default key applies only to
+the default SSP, so a custom SSP without its own key cannot be paid at
+Lightspark's key by mistake — those operations throw before any leaf moves.
 
 ## What NSpark defends against
 
@@ -57,10 +68,20 @@ secured — but it can:
 |---|---|
 | Single rogue Signing Operator | FROST 2-of-3 threshold signing; no individual SO holds the full key. |
 | Single rogue SSP | HTLC payment flow; preimage release is atomic with payment. |
-| Tampered description in BOLT11 | Description hash (32-byte SHA-256) is verified against the issued invoice. |
-| Token replay against SO | Challenge-response auth with per-call signed challenge; tokens are TTL-bounded. |
+| SSP handing out another invoice | An invoice the SSP creates must carry the wallet's payment hash, amount and network, and must not carry a Spark fallback (a Spark identity or invoice the payer could pay instead), before any preimage share is stored. |
+| SSP cooperative exit paying someone else | The exit transaction must hash to the reported txid and pay the destination at least `amount − fee`, and the connector must spend it with one output per leaf, before anything is signed. |
+| SSP fee misreporting | Fees are read in the unit the SSP reports (SATOSHI, MILLISATOSHI rounded up); any other unit is refused. |
+| Coordinator substituting a deposit address | Before a deposit address is returned: the operators' proof of possession (BIP-340), every operator's signature over the address against the configured keys (the coordinator's too for static addresses), and that the address pays the verifying key. |
+| Coordinator injecting an operator | The operator list it reports must match the configuration; secret shares are only encrypted to configured identity keys. |
+| Coordinator altering a token transaction | V3: the final transaction must be the partial one signed (protohash-compared, with the server-set fields only). V2: inputs, outputs, owners, amounts, withdraw bond and locktime, operator keys, client timestamp and a keyshare naming the configured operators are checked before signing. |
+| Sender planting a transfer the wallet refuses | The sender's signature on every leaf is verified before a claim; a transfer that fails is recorded and skipped, and never blocks the others. |
+| Hostile amounts and transactions | Reported amounts are capped at the bitcoin supply; every transaction from an operator, the SSP or a block explorer is parsed with bounds checks, and a deposit transaction must hash to its txid. |
+| Token replay against SO | Challenge-response auth with per-call signed challenge; tokens are TTL-bounded, and a token the operator rejects is dropped at once. |
+| Plaintext operator traffic | Mainnet operator addresses must be `https://`. |
 | Unbounded auth-token retention | Per-instance LRU cache with TTL + size cap. |
-| Routing-fee griefing | `maxFeeSats` enforced before HTLC construction. |
+| Routing-fee griefing | `maxFeeSats` enforced before HTLC construction, and again when a held send is resumed. |
+| Mistyped mnemonic | BIP-39 wordlist and checksum validation before any key is derived (`validateMnemonic: false` opts out). |
+| Spark invoice pasted as an address | Refused: paying it as an address would ignore its amount, expiry and sender. |
 | Truncated reads of native binaries | SHA-256 of every shipped `libspark_frost` published in `runtimes/SHA256SUMS.txt` and the GitHub release notes. |
 | Tampered NuGet package | SLSA build provenance attestation (verify with `gh attestation verify`). NuGet author signing will land once OrkLabs acquires a code-signing certificate. |
 
@@ -90,8 +111,8 @@ secured — but it can:
 - **Limit log sinks**. Send structured logs to a sink that you control;
   redaction works only against `Sensitive<T>.ToString()`, not against
   consumers who log raw byte arrays.
-- **Cap routing fees**. Always pass `maxFeeSats` in production. The
-  default is permissive to keep examples short.
+- **Cap routing fees**. `PayLightningInvoiceAsync` requires `maxFeeSats`;
+  pass the fee estimate you showed the user, not a generous constant.
 - **Run multiple wallets out of one `SparkConnection`** for tenant
   isolation — it's cheap (the connection pool is shared) and limits
   blast radius from misconfiguration.

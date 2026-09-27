@@ -10,11 +10,13 @@ using NSpark;
 using NSpark.Services;
 
 string paymentRequest = "lnbc1u1p4qx..."; // user-supplied
-long maxFeeSats = 50;                     // your routing-fee cap
+
+// Show the user the SSP's fee, then cap the payment at what they accepted.
+long feeSats = await wallet.GetLightningSendFeeEstimateAsync(paymentRequest);
 
 var paymentId = await wallet.PayLightningInvoiceAsync(
     paymentRequest,
-    maxFeeSats: maxFeeSats);
+    maxFeeSats: feeSats);
 
 Console.WriteLine($"Payment id: {paymentId}");
 ```
@@ -27,7 +29,14 @@ the send; poll `GetLightningSendStatusAsync` for the outcome.
 > **`maxFeeSats` is required.** Lightning routing fees are not bounded by
 > the protocol — only by what your wallet is willing to pay. NSpark fetches
 > the SSP's fee estimate first and throws `FeeExceedsLimitException` if it
-> is above the cap, before any leaf is touched.
+> is above the cap, before any leaf is touched. The estimate is offered to
+> the SSP as is (an estimate of 0 is paid as 0), so `maxFeeSats: estimate`
+> always goes through.
+
+The invoice is accepted trimmed and in either case (a string pasted in upper
+case with surrounding whitespace is fine); the trimmed, lower-case form is
+what goes to the SSP. It must carry a payment secret, as BOLT-11 readers
+require, and be for the wallet's network.
 
 ### Amountless invoices
 
@@ -81,14 +90,25 @@ A Lightning send is conceptually three steps:
    point the wallet's leaves move out of `AVAILABLE` and the payment is final.
 
 Because the preimage swap is atomic, **either the payment succeeds and
-the leaves are spent, or it fails and the leaves stay yours**. The one
-partial state is between steps: if the SSP cannot be asked to pay after
-the coordinator locked the leaves, the call throws
+the leaves are spent, or it fails and the leaves stay yours**. The partial
+states are between steps: if the preimage swap fails in a way that leaves
+its outcome unknown (a connection lost after the request went out, a
+deadline, a cancellation, an internal error), or the SSP cannot be asked to
+pay after the coordinator locked the leaves, the call throws
 `SparkLightningSendIncompleteException` carrying the coordinator transfer
-id. Call `PayLightningInvoiceAsync` again with the same invoice and that id
-as `transferId` to resume — the coordinator returns the transfer it already
-holds instead of locking more leaves — or reconcile through the SSP with
-the payment hash.
+id. A swap the operators refused before committing (an invalid argument,
+an unavailable leaf, a lock conflict) throws its own error instead.
+
+To resume, call `PayLightningInvoiceAsync` again with the same invoice and
+that id as `transferId`. The wallet asks the coordinator for the send it
+holds under that id (`query_htlc`) and selects no leaf again: the held
+transfer must be this wallet's HTLC to the SSP for this invoice's payment
+hash, neither returned nor expired, with at most `maxFeeSats` beyond the
+amount — otherwise the call throws (`ArgumentException`,
+`FeeExceedsLimitException`) without asking the SSP. The SSP then pays from
+that transfer; it answers a repeated request for a transfer with the request
+it already has, so a send that went through returns its request id instead
+of paying twice.
 
 ## Estimating routing fees before paying
 
@@ -125,9 +145,12 @@ practical guards:
 
 - BOLT11 payment hashes are unique per invoice. The SSP rejects
   duplicate active sends to the same hash.
-- Pass your own `transferId` (a UUID). NSpark sends it to the coordinator as
-  the idempotency key, so a retry with the same id resumes the existing swap
-  instead of locking a second set of leaves.
+- Pass your own `transferId` (a UUID). It is the preimage swap's
+  idempotency key at the coordinator (every swap carries one — the transfer
+  id when you pass none) and the SSP request's transfer reference, so a
+  retry with the same id resumes the held send instead of locking a second
+  set of leaves, and a retry after the send went through returns its
+  request id.
 - Persist the returned `paymentId` before showing "payment sent" in your
   UI; on retry/replay, check the SSP status via that id before
   re-issuing.
@@ -160,10 +183,11 @@ You don't have to use Lightning for in-Spark transfers — `SendAsync`
 moves leaves directly between wallets with no routing fee:
 
 ```csharp
-var receiverPubKey = Convert.FromHexString(otherWallet.IdentityPublicKeyHex);
-var transfer = await wallet.SendAsync(receiverPubKey, amountSats: 1_000);
+var transfer = await wallet.SendAsync(otherWallet.GetSparkAddress(), amountSats: 1_000);
 ```
 
-The receiver still has to `ClaimPendingTransfersAsync()`. Use Lightning
-when the destination is outside the Spark network; use Spark transfers
-inside it.
+The receiver still has to claim it (`ClaimPendingTransfersAsync()`, or its
+event stream). A Spark invoice is refused by `SendAsync`: it carries an
+amount, expiry and sender restriction that a plain transfer would ignore.
+Use Lightning when the destination is outside the Spark network; use Spark
+transfers inside it.

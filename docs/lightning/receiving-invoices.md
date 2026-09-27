@@ -80,11 +80,15 @@ spendable `AVAILABLE` leaf. Until you call it, the value sits in
 
 The invoice string the SSP returns is decoded and must carry the wallet's
 own payment hash, the requested amount (or none for an amountless
-request), and the wallet's network. Only then are the preimage shares
-stored with the operators. A mismatch throws
-`SparkUntrustedResponseException` and no share leaves the wallet, so an SSP
-cannot hand out an invoice whose preimage it controls under your wallet's
-name. This mirrors the reference SDK's `validateAndCreateLightningInvoice`.
+request), the wallet's network and a payment secret, and must not carry a
+Spark fallback — a Spark identity in the sentinel route hint or a Spark
+invoice in a version-31 fallback field, which the wallet never asks for and
+which payers that prefer Spark would pay instead of this wallet. Only then
+are the preimage shares stored with the operators, each at the operator's
+own share index. A mismatch throws `SparkUntrustedResponseException` and no
+share leaves the wallet, so an SSP cannot hand out an invoice whose preimage
+it controls under your wallet's name. This mirrors the reference SDK's
+`validateAndCreateLightningInvoice`.
 
 ## Continuous polling for incoming payments
 
@@ -94,25 +98,38 @@ Server-side wallets typically poll on an interval:
 var poll = TimeSpan.FromSeconds(5);
 while (!ct.IsCancellationRequested)
 {
-    var claimed = await wallet.ClaimPendingTransfersAsync(ct);
-    foreach (var t in claimed)
+    var claim = await wallet.ClaimPendingTransfersAsync(ct);
+    foreach (var t in claim.ClaimedTransfers)
     {
         // Persist t.Id, credit user's account in your own ledger, etc.
         logger.LogInformation(
             "Claimed transfer {Id}: {Sats} sats from {Sender}",
             t.Id, t.TotalValueSats, t.SenderIdentityPublicKey);
     }
+    foreach (var failure in claim.Failures)
+    {
+        // A transfer that cannot be claimed (e.g. its sender signature does not
+        // verify) is skipped and never blocks the others.
+        logger.LogWarning(failure.Error, "Could not claim transfer {Id}", failure.TransferId);
+    }
     await Task.Delay(poll, ct);
 }
 ```
 
 Idempotency: claiming the same transfer twice is a no-op (the SOs only
-return un-claimed transfers each call). Persist the transfer id in your
-ledger and treat it as the deduplication key.
+return un-claimed transfers each call, and a transfer this wallet already
+claimed counts as claimed). Persist the transfer id in your ledger and treat
+it as the deduplication key.
 
 ## Event-driven receive (no polling)
 
-If your runtime can hold a long-lived stream, subscribe to events instead:
+If your runtime can hold a long-lived stream, subscribe to events instead.
+The stream claims for you: every pending transfer when it connects
+(payments that arrived while it was down included) and each payment as it
+arrives, and reports it afterwards. It reconnects by itself — 1 s doubling
+to 15 s between attempts — and drops a subscription whose heartbeats stop
+for 15 s. It ends when you stop iterating, cancel, or dispose the
+`SparkConnection`.
 
 ```csharp
 await foreach (var evt in wallet.SubscribeEventsAsync(ct))
@@ -120,15 +137,22 @@ await foreach (var evt in wallet.SubscribeEventsAsync(ct))
     switch (evt)
     {
         case ConnectedEvent:
-            // Stream is open. Catch up by claiming any pending receives.
-            await wallet.ClaimPendingTransfersAsync(ct);
+            // Stream is open; pending receives are being claimed.
             break;
 
         case TransferReceivedEvent received:
-            logger.LogInformation("Incoming transfer {Id}: {Sats} sats",
+            // Already claimed: the sats are in the wallet.
+            logger.LogInformation("Received transfer {Id}: {Sats} sats",
                 received.Transfer.Id, received.Transfer.TotalValueSats);
-            // The SDK does NOT auto-claim — you still call this.
-            await wallet.ClaimPendingTransfersAsync(ct);
+            break;
+
+        case TransferSentEvent sent:
+            // A status change of one of this wallet's outgoing transfers.
+            break;
+
+        case ReconnectingEvent reconnecting:
+            logger.LogInformation("Event stream down ({Reason}); retrying in {Delay}",
+                reconnecting.Reason, reconnecting.RetryIn);
             break;
 
         case DepositConfirmedEvent deposit:
@@ -138,6 +162,10 @@ await foreach (var evt in wallet.SubscribeEventsAsync(ct))
     }
 }
 ```
+
+The counter-transfer of the wallet's own leaf swap and a transfer to itself
+are not reported as received: they are not payments, and the operation that
+made them claims them.
 
 ## Inspecting an in-flight receive
 

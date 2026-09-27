@@ -16,15 +16,18 @@ dotnet add package NSpark
 
 - **Real Lightning, not a wrapper.** Talks directly to Spark Signing Operators over gRPC and to your SSP over GraphQL — no daemon to babysit, no node to operate.
 - **Modern .NET.** `net8.0`/`net9.0`/`net10.0`, nullable reference types, async-first, `IHttpClientFactory`, `IOptions<T>`, `ILogger<T>`, `OpenTelemetry`. Plays nicely with ASP.NET Core, the generic host, and minimal APIs.
-- **Cryptographically sound.** BIP-39/BIP-32 derivation via NBitcoin, FROST threshold signing via the audited `spark_frost` Rust library through UniFFI bindings, ECIES share encryption, tagged-hash domain separation, BOLT11 description-hash support for NIP-57 zaps.
+- **Cryptographically sound.** BIP-39/BIP-32 derivation via NBitcoin (with wordlist and checksum validation), FROST threshold signing via the audited `spark_frost` Rust library through UniFFI bindings, ECIES share encryption, tagged-hash domain separation, BOLT11 description-hash support for NIP-57 zaps.
+- **Verifies before it signs.** Deposit addresses, SSP invoices and cooperative exits, token transactions, operator lists and inbound transfers are checked against what the wallet asked for — at parity with the reference TypeScript SDK and the Swift SDK 0.3.0.
 - **Observability by default.** Structured logging with documented `EventId`s, an `ActivitySource` named `"NSpark"`, and a `Meter` with counters/histograms — all of it inactive unless you subscribe.
-- **Resilient.** Pluggable Polly v8 retry/backoff/breaker on transient gRPC failures, bounded auth token cache with TTL eviction.
+- **Resilient.** The reference SDK's transport: 60 s deadlines, retries on UNAVAILABLE/CANCELLED, re-authentication on a rejected session, shared authentication, the operators' clock for token expiry, SSP retries on 502/503/504 — and an event stream that reconnects and claims payments by itself.
 - **Open source.** MIT-licensed, single-package distribution with reproducible builds and SBOM in every release.
 
 ## Quickstart
 
 ```csharp
 using NSpark;
+using NSpark.Models;
+using NSpark.Services;
 
 var options = Microsoft.Extensions.Options.Options.Create(new SparkOptions
 {
@@ -43,13 +46,25 @@ var invoice = await wallet.CreateLightningInvoiceAsync(amountSats: 21_000, memo:
 Console.WriteLine(invoice.PaymentRequest);
 
 // Send (maxFeeSats caps the routing fee; the SSP's estimate is checked first)
-await wallet.PayLightningInvoiceAsync("lnbc...", maxFeeSats: 100);
+var fee = await wallet.GetLightningSendFeeEstimateAsync("lnbc...");
+await wallet.PayLightningInvoiceAsync("lnbc...", maxFeeSats: fee);
+
+// Spark-to-Spark
+await wallet.SendAsync("spark1...", amountSats: 1_000);
 
 // Balance
 var balance = await wallet.GetBalanceAsync();
 Console.WriteLine($"Available: {balance.SatsBalance.Available} sats  (spendable right now)");
 Console.WriteLine($"Owned:     {balance.SatsBalance.Owned} sats  (incl. locked in-flight and frozen)");
 Console.WriteLine($"Incoming:  {balance.SatsBalance.Incoming} sats (pending claim)");
+
+// Incoming payments, until cancelled: the stream claims them, reconnects by itself,
+// and reports each one once its sats are in the wallet
+await foreach (var evt in wallet.SubscribeEventsAsync(cancellationToken))
+{
+    if (evt is TransferReceivedEvent received)
+        Console.WriteLine($"+{received.Transfer.TotalValueSats} sats");
+}
 ```
 
 ### ASP.NET Core / generic host
@@ -129,7 +144,10 @@ NSpark targets a **1.0.0** release on NuGet. Until then, versions are published 
 | BOLT11 send / receive | ✅ |
 | Description-hash (NIP-57 zaps) | ✅ |
 | On-chain deposits / withdrawals | ✅ |
+| Static deposits (claim with a checked quote, refund) | ✅ |
 | Spark-to-Spark transfers | ✅ |
+| Tokens (V3 transactions; V2 on request) | ✅ |
+| Self-healing event stream | ✅ |
 | Unilateral-exit recovery snapshots | ✅ |
 | Leaf renewal & consolidation | ✅ |
 | FROST signing via Rust UniFFI | ✅ |

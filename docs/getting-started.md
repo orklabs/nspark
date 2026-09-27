@@ -71,6 +71,13 @@ cache the identity + deposit public keys, so synchronous accessors like
 `wallet.IdentityPublicKeyHex` and `wallet.GetSparkAddress()` stay
 non-async afterwards.
 
+The phrase is checked against the BIP-39 English wordlist and checksum
+first: a mistyped phrase throws `SparkConfigurationException` instead of
+silently deriving a different, empty wallet. For a phrase known to be
+non-standard, build the signer with
+`SparkSigner.FromMnemonic(mnemonic, account, passphrase, validateMnemonic: false)`
+and pass it to `CreateWalletAsync(signer)`.
+
 > **Never** check a real mnemonic into source control or store it as a
 > string literal in production. See [`docs/signer.md`](signer.md) for
 > patterns that load the mnemonic from a secret store, a hardware wallet,

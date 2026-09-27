@@ -16,14 +16,24 @@ public sealed class SparkOptions
 
     public string[] SigningOperatorAddresses => /* derived */;
 
-    public string SspUrl { get; set; }
-        = "https://api.lightspark.com/graphql/spark/2025-03-19";
+    public const string DefaultSspUrl = "https://api.lightspark.com/graphql/spark/2025-03-19";
+    public string SspUrl { get; set; } = DefaultSspUrl;
 
-    public string SspIdentityPublicKeyHex { get; set; }
-        = GetSspIdentityPublicKey(SparkNetwork.Mainnet);
+    // null: the default SSP's key for the network, but only while SspUrl is the default SSP.
+    public string? SspIdentityPublicKeyHex { get; set; }
+    public string? EffectiveSspIdentityPublicKeyHex { get; }
+
+    public TokenTransactionVersion TokenTransactionVersion { get; set; } = TokenTransactionVersion.V3;
+
+    public uint? SigningThreshold { get; set; }
+    public uint EffectiveSigningThreshold { get; }
+
+    public ulong ExpectedWithdrawBondSats { get; set; } = 10_000;
+    public ulong ExpectedWithdrawRelativeBlockLocktime { get; set; } = 1_000;
 
     public static string GetSspIdentityPublicKey(SparkNetwork network);
     public static SigningOperatorConfig[] GetDefaultOperators(SparkNetwork network);
+    public static uint DefaultSigningThreshold(int operatorCount);
 }
 
 public sealed record SigningOperatorConfig(
@@ -93,31 +103,37 @@ the `AddSpark` configuration lambda.
 Determines:
 
 - The HRP of Spark addresses (`spark1...` mainnet, `sparkrt1...` regtest)
-  and token identifiers (`btkn1...` / `btknrt1...`).
-- The BIP-32 derivation account number used by `SparkSigner.FromMnemonic`
-  if the caller doesn't pass `account` explicitly (regtest → account 0,
-  mainnet → account 1).
+  and token identifiers (`btkn1...` / `btknrt1...`). An address or
+  invoice for the other network is refused.
+- The BIP-32 derivation account number used by
+  `SparkConnection.CreateWalletAsync(mnemonic)` if the caller doesn't pass
+  `account` explicitly (regtest → account 0, mainnet → account 1).
 - The proto `Network` enum on every SO request.
+- Transport security: on mainnet every operator address must be `https://`
+  (a `http://` address throws `SparkConfigurationException` when the
+  `SparkConnection` is built), since operator traffic carries session tokens
+  and signing material. Regtest also accepts `http://`, for local operators.
 
-**Setting `Network` alone does not auto-switch `SigningOperators` or
-`SspUrl` / `SspIdentityPublicKeyHex`.** Each property defaults
-independently. To use the regtest defaults across the board:
+**Setting `Network` alone does not auto-switch `SigningOperators`.** Each
+property defaults independently. The regtest preset is the hosted
+operators under their mainnet keys, as in the reference SDK's `REGTEST`
+preset:
 
 ```csharp
-var network = SparkNetwork.Regtest;
 var options = Options.Create(new SparkOptions
 {
-    Network = network,
-    SigningOperators = SparkOptions.GetDefaultOperators(network),
-    SspIdentityPublicKeyHex = SparkOptions.GetSspIdentityPublicKey(network),
-    SspUrl = "http://localhost:8080/graphql/spark",  // your regtest SSP
+    Network = SparkNetwork.Regtest,
+    SigningOperators = SparkOptions.GetDefaultOperators(SparkNetwork.Regtest),
 });
 ```
+
+With the default `SspUrl`, the regtest SSP key applies automatically (see
+`SspIdentityPublicKeyHex`).
 
 ### `SigningOperators`
 
 - Type: `SigningOperatorConfig[]`
-- Default (mainnet, 3 operators):
+- Default (mainnet and regtest, 3 operators):
 
 | Identifier | Address                                    | Identity public key                                                  |
 | ---------- | ------------------------------------------ | -------------------------------------------------------------------- |
@@ -132,12 +148,24 @@ keeping the default vs. overriding.
 
 Each `SigningOperatorConfig` has three fields:
 
-- `Address` — the operator's HTTPS endpoint (gRPC over HTTP/2).
+- `Address` — the operator's endpoint (gRPC over HTTP/2); `https://` on
+  mainnet.
 - `Identifier` — 32-byte hex identifier used as the SO map key in
-  multi-operator coordination messages. Must be unique within the array.
+  multi-operator coordination messages. It encodes the operator's
+  secret-share index (identifier = index + 1), which is how each operator
+  gets its own preimage share whatever the order of the array. Must be
+  unique within the array.
 - `IdentityPublicKeyHex` — operator's secp256k1 identity public key,
   used for ECIES encryption of FROST shares destined for that operator
-  and for verifying operator-signed messages.
+  and for verifying operator-signed messages (deposit-address signatures,
+  token keyshares).
+
+The first operator is the coordinator. The operator list the coordinator
+reports is reconciled against this array before each signing round: it
+must name exactly the configured operators, with each index used once, or
+the operation fails with `SparkUntrustedResponseException`. Secret shares
+are only ever encrypted to the configured identity keys, never to keys the
+coordinator reports.
 
 ### `SigningOperatorAddresses`
 
@@ -146,33 +174,79 @@ Each `SigningOperatorConfig` has three fields:
 Convenience accessor used internally by `GrpcConnectionPool`. You don't
 set this — set `SigningOperators` instead.
 
+### `SigningThreshold` / `EffectiveSigningThreshold`
+
+- Type: `uint?` / `uint`
+- Default: `null` → `DefaultSigningThreshold(SigningOperators.Length)`
+  (2 of 3, 3 of 5)
+
+The FROST threshold the operators enforce. Set it only for a custom
+operator set.
+
 ### `SspUrl`
 
 - Type: `string`
-- Default: `https://api.lightspark.com/graphql/spark/2025-03-19`
+- Default: `SparkOptions.DefaultSspUrl`
+  (`https://api.lightspark.com/graphql/spark/2025-03-19`)
 - Purpose: GraphQL endpoint of the Spark Service Provider.
 
-The SSP brokers Lightning routing (both directions), cooperative exits
-(withdrawals), and static-deposit claims. Replace this if you run your
-own SSP or target a different Spark deployment.
+The SSP brokers Lightning routing (both directions), leaf swaps,
+cooperative exits (withdrawals), and static-deposit claims. Replace this if
+you run your own SSP or target a different Spark deployment.
 
 The path component `/2025-03-19` is the schema version pin. NSpark's
 GraphQL queries were written against that schema; updating the URL to a
 newer version is a breaking-change moment — be sure your NSpark version
 is compatible.
 
-### `SspIdentityPublicKeyHex`
+SSP requests are retried as the reference SDK retries them: up to 5 more
+attempts, 1 s doubling to 10 s, on HTTP 502/503/504 and on a failed
+connection (not on a timeout or cancellation). A session the SSP no longer
+honours is dropped and the request retried once with a fresh one.
 
-- Type: `string` (hex)
-- Default (mainnet): `023e33e2920326f64ea31058d44777442d97d7d5cbfcf54e3060bc1695e5261c93`
-- Default (regtest): `022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe`
-- Purpose: identity public key of the SSP, used as the HTLC hashlock
-  destination and the receiver identity in Lightning swap flows.
+### `SspIdentityPublicKeyHex` / `EffectiveSspIdentityPublicKeyHex`
 
-If you change `SspUrl` to a custom SSP, **also** change
-`SspIdentityPublicKeyHex` to that SSP's identity key. The two are paired
-— pointing at a different SSP with the wrong identity key causes every
-Lightning send to fail.
+- Type: `string?` (hex) / `string?`
+- Default: `null`
+- Purpose: identity public key of the SSP — the receiver of every transfer
+  to the SSP: Lightning sends (the HTLC hashlock destination), leaf swaps
+  and cooperative exits.
+
+The key comes with the SSP, as in the reference SDK. With the default
+`SspUrl` and no key set, the default SSP's key for the network applies:
+
+- mainnet: `023e33e2920326f64ea31058d44777442d97d7d5cbfcf54e3060bc1695e5261c93`
+- regtest: `022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe`
+
+With a custom `SspUrl`, set `SspIdentityPublicKeyHex` to that SSP's key.
+Without it, `EffectiveSspIdentityPublicKeyHex` is `null` and Lightning
+sends, swaps and withdrawals throw `SparkConfigurationException`
+(`ssp.identity`) before any leaf moves — rather than address Lightspark's
+key while another SSP is asked to act on the transfer. A key that is not a
+compressed secp256k1 key (33 bytes, `02`/`03` prefix) is refused the same
+way.
+
+### `TokenTransactionVersion`
+
+- Type: `TokenTransactionVersion` (`V3` | `V2`)
+- Default: `V3`
+
+How token transactions (`TransferTokensAsync`, `MintTokensAsync`,
+`BurnTokensAsync`, `CreateTokenAsync`) are sent. `V3`, the reference SDK's
+default, is one `broadcast_transaction` call signed over the protohash of
+the partial transaction; the final transaction the operators answer with is
+checked to be the one signed, and its protohash is returned. `V2` keeps the
+older `start_transaction` / `commit_transaction` flow while the operators
+accept it.
+
+### `ExpectedWithdrawBondSats` / `ExpectedWithdrawRelativeBlockLocktime`
+
+- Type: `ulong`
+- Defaults: `10_000` / `1_000` (the reference SDK's)
+
+Every token output carries these; a V3 transaction sets them itself, and a
+V2 final transaction with other values is refused before the wallet signs
+it.
 
 ## Static helpers
 
@@ -188,8 +262,7 @@ opts.SigningOperators = SparkOptions.GetDefaultOperators(opts.Network);
 
 ### `SparkOptions.GetSspIdentityPublicKey(network)`
 
-Returns the canonical SSP identity public key for the named network.
-Used in the same pattern as above.
+Returns the default SSP's identity public key for the named network.
 
 ## Per-wallet vs. per-connection
 
@@ -212,21 +285,36 @@ builder.Services.AddKeyedSingleton<SparkConnection>("mainnet", (sp, _) =>
 builder.Services.AddKeyedSingleton<SparkConnection>("regtest", /* … */);
 ```
 
-## What you don't configure (yet)
+## What you don't configure
 
-These knobs aren't on `SparkOptions` in v0.1.x:
+The operator transport follows the reference SDK and is not configurable:
+
+- **Deadline**: 60 s on every unary call that has none; the event
+  subscription is a long-lived stream without one.
+- **Retries**: up to 3 attempts, 1 s → 10 s backoff, on UNAVAILABLE and
+  CANCELLED (a pooled connection the operator closed heals this way). The
+  authentication service and the event subscription are not retried by the
+  transport.
+- **Authentication**: one challenge exchange per operator and identity at a
+  time, shared by concurrent calls, up to 8 exchanges (a fresh challenge at
+  once when one expired or was used, after 250 ms when the connection
+  failed). A call the operator answers UNAUTHENTICATED drops the token and
+  is re-issued with a fresh one, up to 3 attempts.
+- **Clock**: token expiry and token-transaction timestamps use the
+  operators' clock, estimated from the `date` and `x-processing-time-ms`
+  headers of their answers.
+- **Message size**: 20 MB (128 MiB on the channels recovery snapshots use).
+
+Also not on `SparkOptions`:
 
 - **Token cache size / TTL**. `SparkAuthenticator` accepts these via
   constructor, but `SparkConnection` always uses the defaults
-  (1024 entries / 1-minute refresh buffer). File an issue if you need
-  them surfaced.
-- **Polly pipeline parameters**. Use `SparkResiliencePolicies.Build()`
-  to construct a pipeline; it isn't wired into outbound gRPC calls by
-  default — file an issue.
-- **gRPC channel options** (deadlines, max message size). Defaults from
-  `Grpc.Net.Client` apply.
-- **HttpClient settings**. Drive these via `IHttpClientFactory` named
-  clients in your DI container.
+  (1024 entries / 1-minute refresh buffer).
+- **Polly pipeline parameters**. `SparkResiliencePolicies.Build()`
+  constructs a pipeline for your own calls; the operator transport uses
+  the retry policy above.
+- **HttpClient settings** (the SSP and the block explorer). Drive these via
+  `IHttpClientFactory` named clients in your DI container.
 
 ## See also
 

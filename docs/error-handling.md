@@ -20,6 +20,7 @@ SparkException (abstract)
 │   └── SparkLightningSendIncompleteException  resume with the carried TransferId
 ├── FeeExceedsLimitException           not retryable — raise the cap or wait
 ├── SparkUntrustedResponseException    not retryable — a remote response failed verification
+├── SparkSspException                  retryable on HTTP 502/503/504 — the SSP refused a request
 ├── SparkLeafTimelockExhaustedException  not retryable — renew the leaf first
 ├── SparkTransferException
 ├── SparkDepositException
@@ -29,9 +30,24 @@ SparkException (abstract)
 `SparkUntrustedResponseException` means NSpark refused to sign or hand
 anything over because a remote party's response did not verify: an SSP
 cooperative-exit transaction that does not pay the requested address, an
-SSP invoice without the wallet's payment hash, a coordinator token
-transaction that differs from the submitted one, or an inbound transfer
-whose leaves lack a valid sender signature.
+SSP invoice without the wallet's payment hash or with a Spark fallback, a
+deposit address without a valid proof of possession and operator
+signatures, a coordinator operator list that does not match the
+configuration, a token transaction that differs from the one signed, a
+transaction that does not parse or hash to its txid, or an inbound transfer
+whose leaves lack a valid sender signature. In a claim pass, such a transfer
+is reported in `PendingTransferClaim.Failures` instead of being thrown.
+
+`SparkSspException` carries the SSP's `HttpStatusCode` or its GraphQL
+error messages (`GraphQLErrors`). HTTP 502/503/504 and failed connections
+were already retried (5 more attempts, 1 s doubling to 10 s) before it is
+thrown, and a rejected SSP session was already replaced once.
+
+Calls to the Signing Operators made by wallet operations can also surface
+`Grpc.Core.RpcException` with the operator's status. By then the transport
+has already retried UNAVAILABLE and CANCELLED (3 attempts, 1 s → 10 s) and
+re-issued a call rejected as UNAUTHENTICATED with a fresh session token (3
+attempts); every unary call has a 60 s deadline.
 
 ## What's retryable?
 
@@ -52,7 +68,9 @@ gRPC status codes:
 | `FailedPrecondition` | ❌ | Server-side state mismatch |
 
 Polly v8 (see `NSpark.Connection.SparkResiliencePolicies`) ships a default
-pipeline that handles the retryable codes with exponential backoff + jitter.
+pipeline that handles the retryable codes with exponential backoff + jitter,
+for your own calls around NSpark; the operator transport has its own retry
+policy (above) and does not go through it.
 
 ## Pattern for callers
 
@@ -76,10 +94,16 @@ catch (PaymentFailedException ex)
     // surface to the user.
     logger.LogError(ex, "Payment failed: {Reason}", ex.Reason);
 }
+catch (SparkLightningSendIncompleteException ex)
+{
+    // The coordinator may hold the leaves for this send: call again with the
+    // same invoice and transferId: ex.TransferId to resume, never a new id.
+    logger.LogWarning(ex, "Lightning send {TransferId} incomplete; resuming later.", ex.TransferId);
+}
 catch (SparkConnectionException ex) when (ex.IsRetryable)
 {
-    // Polly already retried within the pipeline budget. If we got here,
-    // the budget is exhausted — schedule a follow-up rather than spinning.
+    // The transport already retried. If we got here, the budget is
+    // exhausted — schedule a follow-up rather than spinning.
     logger.LogError(ex, "Transient connection failure to {Endpoint}.", ex.Endpoint);
 }
 catch (SparkException ex)

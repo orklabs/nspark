@@ -24,12 +24,14 @@ five keys per wallet at `m/8797555' / account' / {0..4}'`:
 | 4     | HTLC preimage (HMAC key)         |
 
 **BIP-39** — Mnemonic phrase → seed standard. The default
-`SparkSigner.FromMnemonic` consumes a 12- or 24-word BIP-39 phrase.
+`SparkSigner.FromMnemonic` consumes a 12- to 24-word BIP-39 phrase and
+checks its wordlist and checksum (`Bip39.Validate`) unless told not to.
 
 **BOLT11** — The original Lightning payment-request format. Encoded as
 a Bech32 string starting with `lnbc...` (mainnet), `lntb...` (testnet),
-or `lnbcrt...` (regtest). NSpark's `Bolt11Decoder` extracts the payment
-hash, amount, and optional description hash.
+or `lnbcrt...` (regtest). NSpark's decoder verifies the bech32 checksum,
+requires a payment secret, and extracts the payment hash, amount, expiry,
+description and any Spark fallback.
 
 **BOLT12** — Newer Lightning offer format. **Not yet supported** by
 NSpark; the package metadata and docs deliberately don't claim BOLT12
@@ -110,8 +112,8 @@ payer learns the preimage.
 
 **Pending transfer** — A `SparkTransfer` whose value the SOs are
 holding for the receiving wallet but which the receiver hasn't yet
-claimed. Surfaced as `SatsBalance.Incoming` and via the
-`TransferReceivedEvent` stream.
+claimed. Surfaced as `SatsBalance.Incoming`; the event stream claims it
+and then reports a `TransferReceivedEvent`.
 
 **Preimage** — 32-byte secret whose SHA-256 is the payment hash.
 NSpark derives preimages deterministically from the transfer id via

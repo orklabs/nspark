@@ -6,29 +6,33 @@ Spark receives are a **two-step** process: the sender's call produces a
 pending transfer, and the receiver has to **claim** it.
 
 ```csharp
-await wallet.ClaimPendingTransfersAsync(ct);
+var claim = await wallet.ClaimPendingTransfersAsync(ct);   // claimed + failures
 var balance = await wallet.GetBalanceAsync(ct);
 ```
 
-Long-running services typically poll this every 5–10 seconds, or
-subscribe to `SubscribeEventsAsync` and call claim on each
-`TransferReceivedEvent`. See
+Long-running services typically subscribe to `SubscribeEventsAsync`,
+which claims pending transfers whenever it connects and each payment as it
+arrives (a `TransferReceivedEvent` is reported after the claim), and
+reconnects by itself; polling the claim every 5–10 seconds works too. See
 [`architecture.md`](architecture.md#the-two-claim-model) and
 [`lightning/receiving-invoices.md`](lightning/receiving-invoices.md).
 
 ## What's the difference between `SatsBalance.Available` and `SatsBalance.Owned`?
 
-- `Available` — sats backed by leaves with status `AVAILABLE` whose refund
-  timelock is above the floor, ready to spend right now.
-- `Frozen` — sats in `AVAILABLE` leaves at the timelock floor. The
-  coordinator will neither move nor renew them; only a unilateral exit
+- `Available` — sats in `AVAILABLE` leaves that can move: refund timelock
+  of 100 blocks or more. Leaves at 100–199 count here because every spend
+  path renews them first.
+- `Frozen` — sats in `AVAILABLE` leaves whose refund timelock is below 100.
+  The coordinator will neither move nor renew them; only a unilateral exit
   recovers them (see [`recovery.md`](recovery.md)).
-- `Owned` — `Available` plus `Frozen` plus sats locked in in-flight
-  outgoing transfers / swaps / renewals (statuses `TRANSFER_LOCKED`,
-  `SPLIT_LOCKED`, `AGGREGATE_LOCK`, `RENEW_LOCKED`). `Locked` is that last
-  part on its own.
-- `Incoming` — pending inbound transfers + `CREATING` deposits not yet
-  claimed.
+- `Owned` — `Available` plus `Frozen` plus sats an in-flight operation
+  still holds for the wallet, as the reference SDK counts them: outgoing
+  transfers, Lightning payments and cooperative exits before the operators
+  apply the sender's key tweak, swaps the wallet started and their
+  counter-transfers until claimed. Sent sats leave `Owned` as soon as the
+  transfer is committed. `Locked` is that last part on its own.
+- `Incoming` — this wallet's leaves of every pending inbound transfer,
+  except counter-transfers of its own swaps (already in `Locked`).
 
 Showing `Owned` in a UI matches what users intuit as "my balance";
 showing `Available` matches what `SendAsync` / `PayLightningInvoiceAsync`
@@ -71,10 +75,12 @@ overhead is one-time per process. Subsequent calls are fast (well under
 
 ## What's the difference between Spark transfer (`SendAsync`) and Lightning send (`PayLightningInvoiceAsync`)?
 
-- `SendAsync(receiverIdentityPublicKey, amountSats)` moves leaves
-  directly between two NSpark wallets via the Signing Operators. No
-  Lightning routing fee. Receiver still has to call
-  `ClaimPendingTransfersAsync`.
+- `SendAsync(receiverSparkAddress, amountSats)` (or the
+  `receiverIdentityPublicKey` overload) moves leaves directly between two
+  Spark wallets via the Signing Operators. No Lightning routing fee. The
+  receiver still has to claim it (its event stream does). A Spark invoice
+  is refused here: it carries an amount, expiry and sender the plain
+  transfer would ignore.
 - `PayLightningInvoiceAsync(bolt11)` pays a BOLT11 invoice through the
   SSP's Lightning node. Has a routing fee. Settles atomically (either
   the leaves are spent and the payment lands, or both fail).

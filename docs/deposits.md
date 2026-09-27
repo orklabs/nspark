@@ -38,6 +38,14 @@ shared address. The returned `DepositAddress` contains:
 - `UserPublicKey` — your contribution to the FROST address.
 - `VerifyingKey` — the FROST group verifying key.
 
+The address is verified before it is returned, as the reference SDK does:
+the operators' proof of possession (a BIP-340 signature by their share of
+the key), every operator's signature over the address against the
+configured identity keys, and that the address pays the verifying key.
+Without these checks a coordinator — or anyone impersonating it — could
+hand out an address it alone controls. A failure throws
+`SparkUntrustedResponseException` and no address is shown.
+
 ### 2. Pay into it (on-chain, external)
 
 The payer sends Bitcoin to `deposit.Address`. NSpark doesn't broadcast
@@ -55,14 +63,15 @@ for your risk model.
 
 ```csharp
 await wallet.ClaimDepositAsync(
-    depositTxId: "abc123...",   // 64-hex transaction id
-    vout: 0,                    // output index of the deposit
-    ct: cancellationToken);
+    depositTxId: "abc123...",   // 64-hex transaction id, any case
+    ct: cancellationToken);     // vout: null finds the output that pays you
 ```
 
-`ClaimDepositAsync` fetches the raw transaction, validates the output
-matches the address NSpark generated, and constructs the Spark tree.
-After it returns, the leaf is in `AVAILABLE` state and shows up in
+`ClaimDepositAsync` fetches the raw transaction (which must hash to the
+txid), finds the output that pays one of this wallet's unused deposit
+addresses — or checks that the `vout` you pass does — and builds the Spark
+tree for the leaf that actually received the funds. Once the funding
+transaction confirms, the leaf is `AVAILABLE` and shows up in
 `SatsBalance.Available`.
 
 `ClaimDepositAsync` returns `Task` (not `Task<…>`) — the leaf id was
@@ -74,7 +83,9 @@ If your application crashes or restarts between step 1 and step 4, you
 can recover the outstanding addresses:
 
 ```csharp
-var unused = await wallet.QueryUnusedDepositAddressesAsync();
+// limit: 0 returns every unused address. The operator pages before it drops the used ones,
+// so a page of the default limit (100) can stop short of the end.
+var unused = await wallet.QueryUnusedDepositAddressesAsync(limit: 0);
 foreach (var entry in unused)
 {
     Console.WriteLine($"{entry.Address}  leafId={entry.LeafId}");
@@ -125,27 +136,46 @@ deposit address for a given user account.
 
 Multiple UTXOs are fine. Each one is claimed separately.
 
-### 3. Get a fee estimate (optional)
+Without an `outputIndex`, every static-deposit call below uses the output
+that pays the wallet's static deposit address, as the reference SDK's
+`getDepositTransactionVout` finds it (the transaction is fetched from the
+block explorer and must hash to the txid). Pass `outputIndex` to name one.
+
+### 3. Get the SSP's quote
 
 ```csharp
-var quote = await wallet.GetDepositFeeEstimateAsync(
-    transactionId: "abc...",
-    outputIndex: 0);
+var quote = await wallet.GetDepositFeeEstimateAsync(transactionId: "abc...");
 
 Console.WriteLine($"Would credit {quote.CreditAmountSats} sats");
 ```
 
-The credit amount reflects the SSP's fee and the actual UTXO value.
+The credit amount reflects the SSP's fee and the actual UTXO value; the
+quote carries the SSP's signature over it.
 
 ### 4. Claim
+
+Claim for exactly the quote you checked — the wallet signs a fixed-amount
+claim for that credit and the SSP's quote signature, so the SSP cannot
+credit less:
 
 ```csharp
 var transferId = await wallet.ClaimStaticDepositAsync(
     transactionId: "abc...",
-    outputIndex: 0);
+    quote: quote);
 ```
 
-This returns a transfer id (not a leaf id) because static-deposit
+Or let the SDK check the fee for you: `ClaimStaticDepositWithMaxFeeAsync`
+compares the SSP's quote with the deposit's value and claims exactly that
+quote, or returns `null` when the fee is above `maxFee`:
+
+```csharp
+var transferId = await wallet.ClaimStaticDepositWithMaxFeeAsync("abc...", maxFee: 500);
+```
+
+(`ClaimStaticDepositAsync(transactionId, outputIndex)` without a quote is
+obsolete: it signs whatever credit the SSP quotes.)
+
+The claim returns a transfer id (not a leaf id) because static-deposit
 claims funnel through the SSP's Spark transfer mechanism. The credited
 amount arrives as a pending transfer — **which you then claim**:
 
@@ -155,10 +185,10 @@ await wallet.ClaimPendingTransfersAsync();
 
 Yes, that's two claim steps for a static deposit:
 
-1. `ClaimStaticDepositAsync(txid, vout)` — co-sign the SSP quote;
+1. `ClaimStaticDepositAsync(txid, quote)` — co-sign the SSP quote;
    produces a pending Spark transfer.
-2. `ClaimPendingTransfersAsync()` — materialize the transfer as a
-   spendable leaf.
+2. `ClaimPendingTransfersAsync()` (or the event stream) — materialize the
+   transfer as a spendable leaf.
 
 This mirrors how Lightning receives work (the SSP creates a pending
 transfer, you claim).
@@ -169,17 +199,19 @@ If you change your mind before claiming, you can refund the UTXO back
 to an on-chain address:
 
 ```csharp
-var refundTxid = await wallet.RefundStaticDepositAsync(
-    transactionId: "abc...",
-    outputIndex: 0,
-    destinationOnChainAddress: "bc1q...",
+var refundTxid = await wallet.RefundAndBroadcastStaticDepositAsync(
+    depositTransactionId: "abc...",
+    destinationAddress: "bc1q...",
     satsPerVbyte: 8);
 ```
 
-`RefundStaticDepositAsync` builds a Taproot spend transaction back to
-the destination address, signs it with the static-deposit FROST round,
-and broadcasts via the configured Bitcoin RPC endpoint (mempool.space
-by default). The returned id is the **on-chain** refund transaction id.
+`RefundStaticDepositAsync` builds the unsigned spend transaction the
+operators rebuild and compare byte for byte (version 3, final sequence, no
+witness), authorizes it with a statement ending in its raw 32-byte sighash,
+signs it in the static-deposit FROST round with the operators, and returns
+the **signed transaction hex**. `RefundAndBroadcastStaticDepositAsync`
+also broadcasts it (mempool.space on mainnet) and returns the **on-chain**
+refund transaction id. The fee rate is 1 to 150 sat/vbyte.
 
 > **One refund per UTXO.** After refund, the UTXO is spent on-chain and
 > cannot be claimed.
@@ -191,16 +223,17 @@ by default). The returned id is the **on-chain** refund transaction id.
 | Address per wallet               | One per `GetDepositAddressAsync`   | One total (deterministic from key)           |
 | UTXOs per address                | Exactly one                        | Many                                         |
 | Fee on receive                   | None (just L1 fees)                | SSP fee (subtracted from quote)              |
-| Claim API                        | `ClaimDepositAsync(txid, vout)`    | `ClaimStaticDepositAsync` + `ClaimPending…`  |
+| Claim API                        | `ClaimDepositAsync(txid)`          | `ClaimStaticDepositAsync(txid, quote)` + `ClaimPending…` |
 | Result                           | Leaf with exact UTXO value         | Spark transfer with quoted credit            |
-| Refund?                          | No (claim or wait)                 | Yes — `RefundStaticDepositAsync`             |
+| Refund?                          | No (claim or wait)                 | Yes — `RefundAndBroadcastStaticDepositAsync` |
 | Recovery list                    | `QueryUnusedDepositAddressesAsync` | n/a (always the same address)                |
 
 ## Event-driven deposit claim
 
-The event stream surfaces `DepositConfirmedEvent` when the SOs detect
-the funding tx confirmed. The wallet still has to call the appropriate
-claim method:
+The event stream reports `DepositConfirmedEvent` once a deposit's leaf is
+`AVAILABLE` — the tree the claim created, with its funding transaction
+confirmed. A static deposit's credit arrives as a transfer, which the event
+stream claims by itself and reports as a `TransferReceivedEvent`.
 
 ```csharp
 await foreach (var evt in wallet.SubscribeEventsAsync(ct))
@@ -208,25 +241,22 @@ await foreach (var evt in wallet.SubscribeEventsAsync(ct))
     switch (evt)
     {
         case DepositConfirmedEvent deposit:
-            logger.LogInformation("Deposit confirmed for tree {TreeId}", deposit.TreeId);
-
-            // For single-use: identify the (txid, vout) and:
-            //   await wallet.ClaimDepositAsync(txid, vout, ct);
-            // For static: use ClaimStaticDepositAsync + ClaimPendingTransfersAsync.
+            logger.LogInformation("Deposit available in tree {TreeId}", deposit.TreeId);
             break;
     }
 }
 ```
 
-The `TreeId` on the event maps to a leaf id you can match against your
-own tracking — store the (txid, vout, leafId) tuple at address-
-generation time.
+The `TreeId` on the event maps to the deposit's tree — store the
+(txid, vout, leafId) tuple at address-generation time to match it.
 
 ## Errors
 
 | Exception                       | Cause                                                          |
 | ------------------------------- | -------------------------------------------------------------- |
 | `SparkDepositException`         | SO-side failure (e.g. tx not yet confirmed, unknown output).   |
+| `SparkUntrustedResponseException` | A deposit address without valid proofs, or a block-explorer transaction that does not hash to its txid. |
+| `SparkConfigurationException`   | A txid that is not 64 hex characters, or no output paying the wallet's address. |
 | `SparkConnectionException`      | gRPC / HTTP transport problem.                                 |
 | `SparkAuthenticationException`  | SO or SSP rejected wallet identity.                            |
 | `SparkSignerException`          | FROST signing or key derivation failed locally.                |

@@ -102,40 +102,63 @@ The public API contract is tracked in `src/NSpark/PublicAPI.Shipped.txt` +
 
 `GrpcConnectionPool` (internal) holds one `GrpcChannel` per configured SO.
 HTTP/2 multiplexes — one channel handles every concurrent request for that
-operator. Channels live as long as the `SparkConnection`.
+operator. Channels live as long as the `SparkConnection`. On mainnet every
+operator address must be `https://`.
 
 Auth uses challenge-response: the SO emits a nonce, the wallet signs it with
-its identity key, the SO returns a session token. Tokens are cached in
-`SparkAuthenticator` (LRU + TTL — default 1024 entries, ~1 hour TTL minus
-30s skew). The cache is per-`SparkConnection`, so different processes don't
-share it.
+its identity key, the SO returns a session token. Concurrent callers share
+one authentication per operator and identity, and up to 8 challenge
+exchanges are made (a fresh challenge at once when one expired or was
+already used, after 250 ms when the connection failed). Tokens are cached in
+`SparkAuthenticator` (LRU + TTL — default 1024 entries, refreshed a minute
+before they expire), with expiry compared against the operators' clock
+(`ServerTimeSync`, estimated from the `date` and `x-processing-time-ms`
+headers of their answers) rather than the host's. Each wallet's calls go
+through `AuthRetryInterceptor`: every attempt carries the operator's current
+token, and a call answered UNAUTHENTICATED drops that token and is re-issued
+with a fresh one, up to 3 attempts.
 
 ### GraphQL to the SSP
 
 `SspGraphQLClient` (internal) uses the shared `HttpClient` from
 `IHttpClientFactory`. The SSP runs a separate auth flow (also
 challenge-response, signed with the same identity key). A separate token
-cache lives in `SspAuthenticator` (internal).
+cache lives in `SspAuthenticator` (internal); a session the SSP rejects is
+dropped and the request retried once with a fresh one.
 
 The SSP brokers off-Spark interactions:
 - Lightning routing (in and out)
+- Leaf swaps (exact change for sends)
 - Cooperative on-chain exits (withdrawals)
 - Static-deposit claim quotes
 
 ## Resilience
 
-Outbound gRPC calls flow through a Polly v8 pipeline assembled by
-`SparkResiliencePolicies.Build()`. The pipeline:
+The operator transport follows the reference SDK's connection manager:
 
-1. **Timeout** — defaults to 30 seconds per attempt.
-2. **Retry** — exponential backoff + jitter, default 3 attempts, only on
-   transient `RpcException` status codes (`Unavailable`,
-   `DeadlineExceeded`, `ResourceExhausted`, `Aborted`).
+1. **Deadline** — 60 s on every unary call that has none. The event
+   subscription is a long-lived stream without one.
+2. **Retry** — the channel's service config retries UNAVAILABLE and
+   CANCELLED, up to 3 attempts with 1 s → 10 s backoff; this is how a pooled
+   connection the operator closed heals. The authentication service is not
+   retried by the transport (a retried `verify_challenge` would re-send a
+   consumed challenge), nor is the event subscription, which reconnects by
+   itself.
+3. **Idempotency** — operations the transport may retry after the operators
+   applied them carry an `x-idempotency-key`: leaf renewals (the txid of the
+   refund being replaced), Lightning preimage swaps (the transfer id) and
+   keyed token transfers.
+4. **Message size** — 20 MB, as in the reference SDK; node queries are paged
+   at the operators' 100 per page.
 
-`Build(timeout, maxRetries)` exposes the knobs; pass `maxRetries: 0` to
-disable retries entirely. See [`error-handling.md`](error-handling.md) for
-the full retryability matrix and how `SparkConnectionException.IsRetryable`
-maps to gRPC status codes.
+SSP requests are retried up to 5 more times, 1 s doubling to 10 s, on HTTP
+502/503/504 and on a failed connection.
+
+`SparkResiliencePolicies.Build(timeout, maxRetries)` assembles a Polly v8
+pipeline for your own calls around NSpark (it is not wired into the
+operator transport). See [`error-handling.md`](error-handling.md) for the
+retryability matrix and how `SparkConnectionException.IsRetryable` maps to
+gRPC status codes.
 
 ## Observability
 
@@ -208,17 +231,28 @@ transaction has enough confirmations. The pattern is:
 // After someone sends you sats:
 //   1. their SendAsync / PayLightningInvoiceAsync returns
 //   2. the SOs hold the transfer in a pending state for you
-//   3. you must call ClaimPendingTransfersAsync to materialize it
-var claimed = await wallet.ClaimPendingTransfersAsync(ct);
-// `claimed` is the list of newly-claimed SparkTransfer records.
+//   3. you claim it to materialize it
+var claim = await wallet.ClaimPendingTransfersAsync(ct);
+// claim.ClaimedTransfers: the transfers claimed by this pass.
+// claim.Failures: transfers that could not be claimed (e.g. a sender signature
+// that does not verify), with the error — they never block the others.
 // Now GetBalanceAsync() reflects the new sats.
 ```
 
-Long-running services that receive payments typically:
+A claim pass follows the reference SDK: pages of 25 until the pending set is
+drained, only claimable statuses, each transfer tried once per pass, claims
+serialised per wallet (a claim pass, a swap's counter-transfer claim and a
+withdraw-all never race). Claimed leaves whose refund timelock is in the
+renewal range are renewed right away.
 
-- Poll `ClaimPendingTransfersAsync` on an interval (e.g. every 5–10 s), or
-- Subscribe to `SubscribeEventsAsync` and call claim on each
-  `TransferReceivedEvent`.
+Long-running services that receive payments typically subscribe to
+`SubscribeEventsAsync`: the stream claims every pending transfer when it
+connects (payments that arrived while it was down included) and each payment
+as it arrives, then reports it as a `TransferReceivedEvent` — the event means
+the sats are already claimed. It reconnects by itself (1 s doubling to 15 s,
+with a `ReconnectingEvent` before each wait) and drops a subscription whose
+heartbeats stop for 15 s. Polling `ClaimPendingTransfersAsync` on an interval
+works too.
 
 The `Incoming` field of `SatsBalance` shows pending receivable sats that
 haven't been claimed yet. See [`lightning/receiving-invoices.md`](lightning/receiving-invoices.md)

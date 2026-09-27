@@ -10,7 +10,149 @@ will be reflected here.
 
 ## [Unreleased]
 
+Brings NSpark to the level of the Swift SDK 0.3.0 (`spark-swift-sdk`, 2026-09-27): parity
+with the reference TypeScript SDK (`buildonspark/spark` at `0b3a32a`) for V3 token
+transactions, verified deposit addresses, safer claims and Lightning sends, a self-healing
+event stream, working static-deposit refunds, and the reference transport. Also carries the
+Swift 0.2.0 items NSpark had not received: operator-list reconciliation, BIP-39 validation,
+bounds-checked transaction parsing, network-checked Spark addresses, and `WithdrawAllAsync`.
+Every flow was re-run on mainnet with the integration wallets (Spark transfers and claims,
+swaps, Lightning sends including the resume path, the event stream, V3 and V2 tokens, the
+coop-exit dry run, renewal and consolidation); 485 unit tests run against an in-process
+operator stand-in on net8.0, net9.0 and net10.0.
+
+### Security
+- **Deposit addresses are verified before they are returned**, as the reference SDK does.
+  `GetDepositAddressAsync` and `GetStaticDepositAddressAsync` returned whatever address and
+  verifying key the coordinator sent, so a coordinator — or anyone impersonating it — could
+  substitute an address it alone controls, and a static address is reused for every deposit.
+  They now check the operators' proof of possession (BIP-340, BIP-86-tweaked operator key),
+  every operator's signature over the address against the configured keys (the coordinator's
+  too for static addresses), and that the address pays the verifying key, and throw
+  `SparkUntrustedResponseException` otherwise.
+- **A custom SSP no longer receives transfers addressed to Lightspark's SSP key.** The SSP
+  identity key defaulted per network whatever `SspUrl` said, so Lightning sends, swaps and
+  cooperative exits named Lightspark's key while another SSP was asked to act on them.
+  `SparkOptions.SspIdentityPublicKeyHex` is now `string?` (default `null`): the default key
+  applies only to the default SSP (`SparkOptions.DefaultSspUrl`), and without a key those
+  operations throw `SparkConfigurationException` (`ssp.identity`) before any leaf moves.
+- **Operators are reached over TLS only on mainnet.** An `http://` operator address got a
+  plaintext channel carrying session tokens and signing material; it now fails when the
+  `SparkConnection` is built. Regtest still accepts `http://` for local operators.
+- **The coordinator's operator list is reconciled with the configuration** before every
+  signing round: it must name exactly the configured operators, each index once, or the
+  operation fails with `SparkUntrustedResponseException`. Secret shares are only encrypted to
+  configured identity keys.
+- `CreateLightningInvoiceAsync` refuses an SSP invoice that carries a Spark fallback — a Spark
+  identity in the sentinel route hint (`f42400f424000001`) or a Spark invoice in a version-31
+  fallback field — which the wallet never asks for; payers that prefer Spark would pay whoever
+  it names. The BOLT-11 decoder reads both forms as the reference SDK does.
+- V2 token commits check the coordinator's final transaction as the reference SDK does: the
+  client timestamp must be unchanged to the millisecond (which the hash covers), and keyshare
+  info naming the configured operators is required — the keyshare checks were skipped when the
+  coordinator left it out.
+- Mnemonics are validated against the BIP-39 English wordlist and checksum before any key is
+  derived (`CreateWalletAsync(mnemonic)`, `SparkSigner.FromMnemonic`,
+  `KeyDerivation.FromMnemonic`): a mistyped phrase silently derived a different, empty wallet.
+  `validateMnemonic: false` keeps the old behaviour for phrases known to be non-standard, now
+  including words outside the wordlist (BIP-39's PBKDF2 seed, as the Swift SDK derives it).
+  Account indexes outside `0 … 2^31 − 1` are refused.
+- Transactions from operators, the SSP and the block explorer are parsed by a bounds-checked
+  parser (`RawTransaction`) that throws `SparkUntrustedResponseException` on malformed input,
+  and a deposit transaction must hash to its txid. Reported amounts are capped at the bitcoin
+  supply, so a hostile value of 2^63 sats or more can no longer wrap negative.
+- Spark addresses are decoded whole, with the identity key checked to be a curve point and the
+  network enforced (`SparkAddress.Decode(address, network)`); a Spark invoice is refused where
+  an address is expected (`SendAsync`, `TransferTokensAsync`): paying it as an address ignored
+  its amount, expiry and sender restriction, and the payee never saw it paid.
+
+### Added
+- `SparkOptions.TokenTransactionVersion` and `TokenTransactionVersion` (`V3` default, `V2`).
+- `SparkOptions.DefaultSspUrl`, `EffectiveSspIdentityPublicKeyHex`.
+- `ClaimStaticDepositAsync(transactionId, DepositFeeEstimate quote, uint? outputIndex)`: claims
+  a static deposit for exactly the credit of a quote from `GetDepositFeeEstimateAsync`.
+  `QueryStaticDepositAddressesAsync`, `RefundAndBroadcastStaticDepositAsync`.
+- `QuoteWithdrawAllAsync` / `WithdrawAllAsync` with `WithdrawAllQuote` / `WithdrawAllResult`:
+  send every spendable sat in one cooperative exit, reporting what stays behind (`FrozenSats`,
+  `UnrenewedSats`, `LockedSats`, `UnclaimedSats`).
+- `PendingTransferClaim` (returned by `ClaimPendingTransfersAsync`): the claimed transfers and
+  `ClaimedTransferIds`, plus `Failures` — transfers that could not be claimed, with their error.
+  It is an `IReadOnlyList<SparkTransfer>` of the claimed transfers, so existing callers compile.
+- `SendAsync(string receiverSparkAddress, long amountSats)`.
+- `GetTransfersAsync(..., TransferDirection direction)` (`Both`, `Sent`, `Received`).
+- `SparkLeaf.IsFrozen`; `SparkTransfer.SparkInvoice`.
+- Events: `ReconnectingEvent(Attempt, RetryIn, Reason)`, `TransferSentEvent`.
+- `SparkSspException` (`HttpStatusCode`, `GraphQLErrors`; retryable on 502/503/504).
+- `Bip39.Validate` / `Bip39.IsValid`; `validateMnemonic` on `SparkSigner.FromMnemonic` and
+  `KeyDerivation.FromMnemonic`.
+- `SparkAddress.Encode(identityPublicKey, network)` / `Decode(sparkAddress, network)`
+  (`DecodeIdentityPublicKey` is obsolete).
+- Integration tests: `HardeningIntegrationTests` (the Swift hardening suite: transfers, claim
+  passes, swaps, Lightning incl. resume, fee caps, events, frozen accounting; on-chain drains,
+  static claims and refunds behind `NSPARK_TEST_*` opt-ins), `TransportIntegrationTests`, and
+  token tests for concurrent sends, idempotent retries and V2, each checked against the
+  operators' own record of the transaction.
+
 ### Changed
+- **Token transactions use the operators' V3 format by default**, as the reference SDK has
+  since 0.5.1: one `broadcast_transaction`, signed over the protohash of the partial
+  transaction, outputs carrying the network's withdraw bond and locktime, valid for 180 s. The
+  final transaction the operators answer with must be the one signed (protohash-compared), and
+  its protohash is returned — on mainnet the operators hold each transaction under that hash.
+  `TokenTransactionVersion.V2` keeps the two-step flow. Token timestamps use the operators'
+  clock.
+- **Breaking:** `SubscribeEventsAsync` streams until the caller stops, cancels, or the
+  `SparkConnection` is disposed; it throws only when the connection is already disposed. It
+  reconnects by itself (1 s doubling to 15 s, a `ReconnectingEvent` before each wait), claims
+  pending transfers on every connection and each payment as it arrives before reporting it as
+  `TransferReceivedEvent`, and drops a subscription silent for 15 s once it has seen heartbeats.
+  Counter-transfers of the wallet's own swaps and self-transfers are no longer reported as
+  received; `TransferSentEvent` reports outgoing transfers; a deposit is reported once its leaf
+  is AVAILABLE. Migration: switches over `SparkEvent` should handle the new types, and code that
+  claimed on each `TransferReceivedEvent` can stop.
+- **Breaking:** `ClaimPendingTransfersAsync` returns `PendingTransferClaim` (see Added) and
+  follows the reference SDK's claim pass: pages of 25 until drained, claimable statuses only,
+  each transfer tried once per pass, failures recorded instead of stopping the pass, claims
+  serialised per wallet, and a transfer already recorded as claimed by this wallet
+  (ALREADY_EXISTS) counts as claimed. Claimed leaves in the renewal range are renewed.
+- **Breaking:** static-deposit calls take `uint? outputIndex = null`: without one,
+  `GetDepositFeeEstimateAsync`, `ClaimStaticDepositAsync`, `ClaimStaticDepositWithMaxFeeAsync`,
+  `RefundStaticDepositAsync` and `RefundAndBroadcastStaticDepositAsync` use the output that pays
+  the wallet's static deposit address instead of output 0. `ClaimDepositAsync` takes
+  `uint? vout = null` and finds the output that pays one of the wallet's unused deposit
+  addresses (an explicit `vout` must pay one). `ClaimStaticDepositAsync(transactionId,
+  outputIndex)` is obsolete: it signs whatever credit the SSP quotes.
+- **Breaking:** `GetTransfersAsync` lists only user transfers — Spark transfers, Lightning
+  payments, cooperative exits and static-deposit claims — as the reference SDK does, not
+  leaf-swap legs; on mainnet the unfiltered query took 17 s to over a minute for a long history.
+  `GetTransferAsync` uses the operators' by-id query (`query_transfers_by_id`) and takes the id
+  in any case.
+- **Breaking:** `CreateTokenAsync` checks the name (3–20 UTF-8 bytes) and ticker (3–6) in
+  Unicode normalization form C, as the operators and the reference SDK do; the operators refused
+  other tokens with only INTERNAL "Something went wrong."
+- **Breaking:** BOLT-11 invoices without a payment secret are refused, as BOLT-11 readers must
+  and the reference SDK does.
+- `SatsBalance.Owned` / `Locked` follow the reference SDK: available + frozen + leaves an
+  in-flight operation still holds for the wallet (outgoing transfers, Lightning payments and
+  cooperative exits before the sender key tweak, swaps and their counter-transfers until
+  claimed). Sent sats leave `Owned` as soon as the transfer is committed. `Incoming` sums this
+  wallet's leaves of every page of pending transfers, except counter-transfers of its own swaps.
+  Node queries are paged at 100 and only AVAILABLE nodes are read.
+- `SatsBalance.Frozen` counts only leaves below 100 blocks (the coordinator renews from 100);
+  leaves at 100–199 count as available because every spend path renews them first.
+- `SparkLeaf.IsSpendable` means a rounded refund timelock above 100 (at least 200); see Fixed.
+  `RefundTimelockBlocks` reads the refund transaction only.
+- The regtest preset (`GetDefaultOperators(SparkNetwork.Regtest)`) is the hosted operators under
+  their keys, as the reference SDK's REGTEST preset: it named localhost operators with empty
+  keys that nothing could talk to.
+- Protos re-vendored from `buildonspark/spark` at `0b3a32a` (event heartbeats, transfer
+  receivers, `query_transfers_by_id`, V3 token messages, …). The C# generator's clash between
+  `UpdateWalletSettingRequest`'s oneof and its field is avoided by renaming the oneof (oneof
+  names are not on the wire).
+- `TokenOutputInfo.Status` is reported in the documented operator spelling (`"AVAILABLE"`,
+  `"PENDING_OUTBOUND"`); it read `"Available"` when the operators set it.
+- Spark transfers and Lightning sends carry a 16-day transfer expiry (transfers had 10 minutes), as
+  the Swift SDK sets it.
 - Dependencies bumped to the latest stable releases: Microsoft.Extensions.* 10.0.12,
   Google.Protobuf 3.36.1, Grpc.Net.Client / Grpc.Net.ClientFactory 2.83.0, Grpc.Tools
   2.84.0, NBitcoin 10.0.10, Polly 8.8.0, MinVer 8.0.0,
@@ -28,6 +170,80 @@ will be reflected here.
   starting balance instead of assuming B starts empty, and the pure leaf-selection
   tests build leaves with a fresh refund timelock now that selection skips leaves at
   the floor.
+
+### Fixed
+- **Operator transport, as the reference SDK's connection manager.** Unary calls had no
+  deadline, so a connection that looked alive but never answered parked the caller until the
+  process restarted; they now get 60 s. UNAVAILABLE and CANCELLED are retried (3 attempts,
+  1 s → 10 s), which heals a pooled connection the operator closed. Messages up to 20 MB are
+  accepted (gRPC's 4 MiB default failed ~5 MB answers). The authentication service and the event
+  stream are not retried by the transport.
+- **Authentication is shared and retried as in the reference SDK.** Concurrent calls each ran
+  their own challenge — `GetBalanceAsync` alone started several — and a retried
+  `verify_challenge` re-sent a consumed challenge ("challenge reused"). Callers now share one
+  authentication per operator and identity, with up to 8 challenge exchanges (a fresh challenge
+  at once when one expired or was used, after 250 ms when the connection failed). A call the
+  operator answers UNAUTHENTICATED drops the token and is re-issued with a fresh one (3
+  attempts); a rejected event subscription drops its token too.
+- **The SDK keeps time by the operators' clock.** Session-token expiry (their time) was compared
+  with the host clock, so a host clock running ahead re-authenticated on every call and one
+  running behind kept using expired tokens; token transactions were stamped with the host clock,
+  which the operators refuse outside the validity window. The clock is estimated from the `date`
+  and `x-processing-time-ms` headers of their answers and advanced on the monotonic clock.
+- **SSP requests are retried** as in the reference SDK: up to 5 more attempts, 1 s doubling to
+  10 s, on HTTP 502/503/504 and failed connections; a session the SSP rejects is dropped and the
+  request retried once. SSP fees are read in their reported unit (SATOSHI, MILLISATOSHI rounded
+  up); any other unit is refused.
+- **Leaves whose refund timelock is not a multiple of 100 can be spent again, and leaves at
+  101–199 are no longer selected without a renewal.** The next refund timelock was the current
+  one minus 100; the operators require the current one rounded down to the interval, minus 100
+  (740 → 600, not 640), and refuse a leaf whose rounded timelock is 100 or less. Lightning HTLC
+  refunds keep their unrounded offsets, as the operators rebuild them.
+- **Leaves on a zero-timelock node can be sent and claimed again.** A direct refund was built
+  whenever the node carried a direct transaction, which the operators reject for a zero node
+  ("zero nodes must not have a direct refund tx") — the shape zero-timelock renewal leaves.
+  Send, claim and cooperative exit now share one refund builder with the reference SDK's
+  `isZeroNode` rule.
+- **Leaves hanging off any output but the first of their parent can be renewed**, and legacy
+  deposit roots with a final (timelock-disabled) node sequence are renewed like zero-timelock
+  nodes. Renewals spent parent output 0 and paid that output's script, while the operators
+  rebuild from the parent's output at the leaf's `vout`, paying P2TR of the leaf's verifying key.
+  Renewals carry an idempotency key (the txid of the refund they replace), so a transport retry
+  of an applied renewal no longer reports it failed. Consolidation renews between rounds.
+- **One pending transfer the SDK cannot claim no longer blocks every other payment** (see the
+  claim pass under Changed): anyone can plant a transfer the SDK rightly refuses, since the
+  operators store per-leaf sender signatures without verifying them.
+- **A multi-receiver transfer can be claimed by every receiver.** The operators record only the
+  lowest receiver key in `receiver_identity_public_key`; the transfer is now narrowed to this
+  wallet's receiver edge and its leaves before it is verified and claimed.
+- **Static-deposit refunds work.** Four defects each stopped every refund: the unsigned spend
+  was serialised with a segwit marker and empty witness, the deposit txid went to the operators
+  in internal byte order (they look deposits up in display order), the refund statement ended
+  with the sighash as hex instead of its 32 raw bytes, and the request set `hash_variant` V2,
+  which has the operators check the signature against a tagged-hash statement, while the SDK
+  signs the legacy one (the reference SDK leaves it unset). `ClaimStaticDepositWithMaxFeeAsync`
+  claims the quote it checked (it fetched a second quote and signed that one unchecked), against
+  a deposit value from a transaction that hashes to its txid. Txids are accepted in any case.
+- **Lightning sends:** the SSP's fee estimate is offered as is (a 1-sat floor refused
+  `maxFeeSats: estimate`); the trimmed, lower-case invoice is what goes to the SSP (a pasted
+  invoice passed the checks but the raw string was refused); every preimage swap carries an
+  idempotency key (the transfer id when none is given); a swap whose outcome is unknown (lost
+  connection, deadline, cancellation, internal error) throws
+  `SparkLightningSendIncompleteException` with the transfer id; and resuming with that id no
+  longer selects leaves again — the held send is looked up (`query_htlc`), checked (this
+  wallet's HTLC to the SSP for this invoice, not returned or expired, within `maxFeeSats`), and
+  paid from; a send that went through returns its request id instead of paying twice.
+- **Lightning receives:** each operator gets the preimage share at its own index (encoded in
+  its identifier) whatever the configured order; the memo is limited to 639 bytes.
+- **Token sends no longer collide:** only AVAILABLE outputs are picked (not PENDING_OUTBOUND),
+  and picked outputs are locked for 30 s or until reported pending, so concurrent sends from one
+  wallet spend different outputs. `TransferTokensAsync(idempotencyKey:)` resends the first
+  transaction unchanged on retry (a rebuilt one was refused as "input 0 changed" after the first
+  had gone through); a key used for another transfer is refused. Invoice attachments are hashed
+  in invoice-id order, as the operators hash them.
+- **Unwanted tokens no longer break balances:** metadata is asked for 500 tokens at a time (the
+  operators refuse more), and `GetBalanceAsync` reports token balances best effort instead of
+  failing the sats balance with them.
 
 ## [0.2.0-alpha.4] - 2026-09-15
 

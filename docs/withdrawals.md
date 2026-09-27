@@ -134,7 +134,36 @@ var txid = await wallet.WithdrawAsync("bc1q...", 10_000);
 ```
 
 Use `balance.SatsBalance.Available` (which already excludes frozen leaves)
-as the basis for a "withdraw everything" amount.
+as the basis for a "withdraw" amount, or `WithdrawAllAsync` to send
+everything.
+
+## Withdraw everything
+
+`QuoteWithdrawAllAsync` does everything `WithdrawAllAsync` would do except
+the exit itself — it claims pending inbound transfers, renews what the
+operators will renew and asks the SSP for the fee — so you can show the user
+what moves, what it costs and what stays behind:
+
+```csharp
+var quote = await wallet.QuoteWithdrawAllAsync("bc1q...");
+Console.WriteLine($"send {quote.SpendableSats}, fee {quote.QuotedFeeSats}, " +
+                  $"payout ≈ {quote.EstimatedPayoutSats}, frozen {quote.FrozenSats} " +
+                  $"({quote.FrozenFraction:P1}), locked {quote.LockedSats}");
+
+if (quote.CoversFee)
+{
+    var result = await wallet.WithdrawAllAsync("bc1q...", maxFeeSats: quote.QuotedFeeSats);
+    Console.WriteLine($"{result.Txid}: paid {result.PayoutSats}, fee {result.FeeSats}");
+}
+```
+
+Every spendable leaf goes into one cooperative exit, with the same response
+verification and fee bound as `WithdrawAsync`. What cannot leave is reported
+rather than silently dropped: `FrozenSats` (refund timelock below 100 — only
+a unilateral exit recovers them), `UnrenewedSats` (renewable leaves the
+operators did not renew this time; a later attempt can move them),
+`LockedSats` (held by an in-flight operation) and, on the result,
+`UnclaimedSats` (inbound sats that could not be claimed first).
 
 ## Errors
 

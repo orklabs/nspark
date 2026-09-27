@@ -58,22 +58,31 @@ Rules that matter:
 
 ## Leaf renewal
 
-Spark leaves age: each transfer decrements the refund timelock by 100 blocks.
-Below **200** a leaf needs renewal; at or below **100** the coordinator
-refuses to move it at all. Inspect a leaf's remaining margin with
-`SparkLeaf.RefundTimelockBlocks`, or the two derived flags:
+Spark leaves age: each transfer takes 100 blocks off the refund timelock —
+precisely, the next refund's timelock is the current one **rounded down to
+the 100-block interval**, minus 100, which is what the operators require (a
+leaf at 740 moves to 600). The operators refuse to move a leaf whose rounded
+timelock is 100 or less, so a leaf needs a refund timelock of at least
+**200** to move and **100–199** to be renewed. Inspect a leaf's remaining
+margin with `SparkLeaf.RefundTimelockBlocks`, or the derived flags:
 
-- `SparkLeaf.IsSpendable` — above the floor; every spend path selects only
-  from these.
+- `SparkLeaf.IsSpendable` — rounded refund timelock above 100 (at least
+  200); every spend path selects only from these.
 - `SparkLeaf.IsRenewable` — refund timelock in `[100, 200)`, the range the
   coordinator will renew.
+- `SparkLeaf.IsFrozen` — refund timelock below 100: the coordinator will
+  neither move nor renew it.
 
 Spend paths renew automatically: `GetSpendableLeavesAsync()` renews the
-renewable leaves first, then excludes whatever is still at the floor, so one
-stuck leaf never fails a send other leaves could cover. Those sats show up
-as `SatsBalance.Frozen` rather than `Available`. Leaves below 100 stay
-frozen: the coordinator will not renew them either, and only a unilateral
-exit recovers them.
+renewable leaves first, then leaves out whatever cannot move, so one stuck
+leaf never fails a send other leaves could cover. Claimed leaves and swap
+outputs that arrive in the renewal range (a transfer from a leaf at 200
+delivers it at 100) are renewed right away. Only leaves below 100 show up as
+`SatsBalance.Frozen` rather than `Available`: the coordinator will not renew
+them, and only a unilateral exit recovers them. (Lightning HTLC refunds are
+the one exception to the rounding: they sit 70 and 85 blocks above the
+unrounded refund timelock minus 100, which is how the operators rebuild
+them.)
 
 ```csharp
 var result = await wallet.RenewExhaustedLeavesAsync();
@@ -84,10 +93,18 @@ foreach (var failure in result.Failures) Console.WriteLine($"  {failure}");
 The sweep renews every leaf whose refund timelock is below 200 via the
 coordinator's `renew_leaf` RPC, choosing the protocol variant per leaf:
 
-- node timelock `== 0` → `renew_node_zero_timelock` (L1-deposit roots)
+- node timelock `== 0`, or a final (timelock-disabled) node sequence, as
+  legacy deposit roots have → `renew_node_zero_timelock`
 - node timelock `< 200` → `renew_node_timelock` (splices in a zero-timelock
   "split node"; node and refund timelocks reset to 2000)
 - otherwise → `renew_refund_timelock` (node timelock −100, refund reset to 2000)
+
+The new node (or split node) spends the parent's output at the leaf's own
+`vout` and pays the leaf's node address (P2TR of its verifying key), exactly
+what the operators rebuild and compare byte for byte — so leaves hanging off
+any output of their parent can be renewed. Each renewal carries an
+idempotency key (the txid of the refund it replaces), so a transport retry of
+a renewal the operators already applied gets their answer.
 
 Renewal only re-signs transactions with the leaf's existing signing key —
 there is no key tweak and no ownership change. It is per-leaf and
