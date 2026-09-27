@@ -45,4 +45,31 @@ internal static class CurrencyAmountExtensions
             _ => originalValue,
         };
     }
+
+    /// <summary>
+    /// An SSP fee (<c>original_value</c> in <c>original_unit</c>) in whole sats, strictly: SATOSHI
+    /// as is, MILLISATOSHI rounded up; any other unit, a missing unit or a negative value is
+    /// refused, as the reference SDK refuses a fee estimate in another unit. A fee read in the
+    /// wrong unit would be capped against the wrong number and, for Lightning, underpaid after the
+    /// leaves were locked.
+    /// </summary>
+    /// <exception cref="Exceptions.SparkUntrustedResponseException">The amount is not one of those.</exception>
+    public static long ToFeeSats(long originalValue, string? originalUnit, string field)
+    {
+        if (originalValue < 0)
+        {
+            throw new Exceptions.SparkUntrustedResponseException(
+                "ssp.amount", $"The SSP's {field} is negative ({originalValue}).");
+        }
+
+        return originalUnit switch
+        {
+            "SATOSHI" => originalValue,
+            "MILLISATOSHI" => (originalValue / 1000) + (originalValue % 1000 == 0 ? 0 : 1),
+            null => throw new Exceptions.SparkUntrustedResponseException(
+                "ssp.amount", $"The SSP's {field} has no unit."),
+            _ => throw new Exceptions.SparkUntrustedResponseException(
+                "ssp.amount", $"The SSP's {field} is in an unsupported unit: {originalUnit}."),
+        };
+    }
 }

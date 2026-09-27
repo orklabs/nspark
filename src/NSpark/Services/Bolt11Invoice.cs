@@ -38,17 +38,32 @@ internal enum Bolt11Network
 /// <param name="AmountMsat">Amount in millisatoshi, <c>null</c> for an amountless invoice.</param>
 /// <param name="Timestamp">Invoice creation time, seconds since the Unix epoch.</param>
 /// <param name="ExpirySeconds">Seconds after <paramref name="Timestamp"/> until the invoice expires (tag <c>x</c>, default 3600).</param>
-/// <param name="PaymentSecret">Payment secret (tag <c>s</c>), if present.</param>
+/// <param name="PaymentSecret">
+/// Payment secret (tag <c>s</c>). BOLT-11 readers must fail a payment without one, and the
+/// reference SDK refuses such invoices, so decoding does too.
+/// </param>
 /// <param name="Description">Short description (tag <c>d</c>), if present.</param>
+/// <param name="SparkFallback">
+/// A Spark payment target embedded in the invoice, decoded as the reference SDK does: a Spark
+/// invoice in a fallback-address field (tag <c>f</c>, version 31), or else a Spark identity public
+/// key (hex) in a route hint whose short channel id is the sentinel <c>f42400f424000001</c>.
+/// </param>
 internal sealed record Bolt11Invoice(
     Bolt11Network Network,
     byte[] PaymentHash,
     ulong? AmountMsat,
     ulong Timestamp,
     ulong ExpirySeconds,
-    byte[]? PaymentSecret,
-    string? Description)
+    byte[] PaymentSecret,
+    string? Description,
+    string? SparkFallback = null)
 {
+    /// <summary>Fallback-address version the reference SDK uses for an embedded Spark invoice.</summary>
+    private const byte SparkInvoiceFallbackVersion = 31;
+
+    /// <summary>Short channel id of the route hint hop that carries a Spark identity public key.</summary>
+    private static readonly byte[] s_sparkIdentityShortChannelId = [0xF4, 0x24, 0x00, 0xF4, 0x24, 0x00, 0x00, 0x01];
+
     private const string Operation = "lightning.invoice.decode";
     private const int SignatureWords = 104; // 65 bytes of recoverable signature
     private const int TimestampWords = 7;
@@ -123,6 +138,8 @@ internal sealed record Bolt11Invoice(
         byte[]? paymentSecret = null;
         ulong? expiry = null;
         string? description = null;
+        string? sparkInvoiceFallback = null;
+        string? routeHintFallback = null;
 
         var pos = 0;
         while (pos + 3 <= fields.Length)
@@ -169,6 +186,16 @@ internal sealed record Bolt11Invoice(
                     }
                     break;
                 }
+                case 9 when sparkInvoiceFallback is null && length > 0 && data[0] == SparkInvoiceFallbackVersion:
+                    // f: fallback address; version 31 carries a Spark invoice. Lossy on purpose,
+                    // like the reference SDK's TextDecoder: a version-31 field counts as a Spark
+                    // fallback even when its bytes are not valid UTF-8.
+                    sparkInvoiceFallback = Encoding.UTF8.GetString(LenientBytesFromWords(data[1..]));
+                    break;
+                case 3 when routeHintFallback is null:
+                    // r: route hints; the sentinel hop names a Spark identity.
+                    routeHintFallback = SparkIdentityInRouteHint(LenientBytesFromWords(data));
+                    break;
                 default:
                     // Unknown or wrongly sized fields are skipped, as BOLT-11 requires of readers.
                     break;
@@ -185,6 +212,11 @@ internal sealed record Bolt11Invoice(
             throw Invalid(trimmed, "Missing payment hash (p field).");
         }
 
+        if (paymentSecret is null)
+        {
+            throw Invalid(trimmed, "Missing payment secret (s field).");
+        }
+
         return new Bolt11Invoice(
             network,
             paymentHash,
@@ -192,7 +224,8 @@ internal sealed record Bolt11Invoice(
             timestamp,
             expiry ?? 3600,
             paymentSecret,
-            description);
+            description,
+            sparkInvoiceFallback ?? routeHintFallback);
     }
 
     /// <summary><c>ln</c> + currency + optional amount + optional multiplier.</summary>
@@ -323,6 +356,47 @@ internal sealed record Bolt11Invoice(
         return product;
     }
 
+    /// <summary>
+    /// The public key (hex) of the first route-hint hop with the Spark sentinel short channel id.
+    /// A hop is 51 bytes: pubkey (33), short channel id (8), base fee (4), proportional fee (4),
+    /// CLTV delta (2).
+    /// </summary>
+    private static string? SparkIdentityInRouteHint(byte[] bytes)
+    {
+        for (var offset = 0; offset + 51 <= bytes.Length; offset += 51)
+        {
+            if (bytes.AsSpan(offset + 33, 8).SequenceEqual(s_sparkIdentityShortChannelId))
+            {
+                return Convert.ToHexString(bytes, offset, 33).ToLowerInvariant();
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 5-bit words to bytes, ignoring leftover padding bits (the reference SDK's
+    /// <c>fromWordsLenient</c>).
+    /// </summary>
+    private static byte[] LenientBytesFromWords(ReadOnlySpan<byte> words)
+    {
+        var accumulator = 0;
+        var bits = 0;
+        var result = new List<byte>((words.Length * 5 / 8) + 1);
+        foreach (var word in words)
+        {
+            accumulator = ((accumulator << 5) | (word & 0x1F)) & 0xFFFF;
+            bits += 5;
+            if (bits >= 8)
+            {
+                bits -= 8;
+                result.Add((byte)((accumulator >> bits) & 0xFF));
+            }
+        }
+
+        return [.. result];
+    }
+
     /// <summary>Fixed-size byte field carried as 5-bit words (trailing padding bits are ignored).</summary>
     private static byte[]? BytesFromWords(ReadOnlySpan<byte> words, int count)
     {
@@ -342,9 +416,138 @@ internal sealed record Bolt11Invoice(
     }
 }
 
+/// <summary>
+/// A Lightning payment <c>PayLightningInvoiceAsync</c> has checked before touching a leaf: a
+/// BOLT-11 invoice for the wallet's network, the amount to pay and the fee cap.
+/// </summary>
+internal sealed record LightningPayment
+{
+    private const string Operation = "lightning.pay";
+
+    public LightningPayment(string paymentRequest, long maxFeeSats, long? amountSats, string? idempotencyKey, SparkNetwork network)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(paymentRequest);
+        if (maxFeeSats < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxFeeSats), maxFeeSats, "maxFeeSats must not be negative.");
+        }
+
+        var trimmed = paymentRequest.Trim();
+        var invoice = Bolt11Invoice.Decode(trimmed);
+        if (!invoice.BelongsTo(network))
+        {
+            throw new InvalidBolt11Exception(
+                Operation, $"The invoice is for {invoice.Network}; the wallet is on {network}.")
+            {
+                PaymentRequest = paymentRequest,
+            };
+        }
+
+        // Decoded before lower-casing, so a mixed-case string is still refused.
+        EncodedInvoice = trimmed.ToLowerInvariant();
+        Invoice = invoice;
+        AmountSats = LightningValidator.ResolvePaymentAmountSats(invoice.AmountMsat, amountSats);
+        MaxFeeSats = maxFeeSats;
+        IdempotencyKey = idempotencyKey;
+    }
+
+    /// <summary>
+    /// The invoice as validated, in the form sent on: surrounding whitespace dropped and lower
+    /// case (the reference SDK lower-cases it before use; the SSP refuses anything else).
+    /// </summary>
+    public string EncodedInvoice { get; }
+
+    public Bolt11Invoice Invoice { get; }
+
+    /// <summary>Sats the invoice is paid with: its own amount, or the caller's for an amountless invoice.</summary>
+    public long AmountSats { get; }
+
+    public long MaxFeeSats { get; }
+
+    public string? IdempotencyKey { get; }
+
+    /// <summary>The caller's amount for an amountless invoice — the only case the SSP is told one.</summary>
+    public long? AmountlessInvoiceAmountSats => Invoice.AmountMsat is null ? AmountSats : null;
+}
+
 /// <summary>Client-side checks around Lightning payments and invoices.</summary>
 internal static class LightningValidator
 {
+    /// <summary>
+    /// The fee a Lightning send offers the SSP: its estimate, refused above the caller's cap — the
+    /// reference SDK's <c>maxFeeSats &lt; feeEstimate</c> check. No floor: an estimate of 0 is
+    /// offered as 0, so <c>maxFeeSats: estimate</c> always goes through.
+    /// </summary>
+    public static ulong SendFeeSats(long estimate, long maxFeeSats)
+    {
+        if (estimate < 0)
+        {
+            throw new SparkUntrustedResponseException("lightning.fee", $"The SSP returned a negative Lightning fee estimate: {estimate}.");
+        }
+
+        if (estimate > maxFeeSats)
+        {
+            throw new FeeExceedsLimitException("lightning.pay", estimate, maxFeeSats);
+        }
+
+        return (ulong)estimate;
+    }
+
+    /// <summary>
+    /// Check the Lightning send the coordinator holds under a transfer id the caller is resuming,
+    /// before the SSP is asked to pay from it: this wallet's HTLC to the SSP for this invoice's
+    /// payment hash, neither returned nor expired, whose leaves cover the amount with at most
+    /// <c>maxFeeSats</c> on top — what the SSP keeps beyond the invoice.
+    /// </summary>
+    public static void VerifyHeldSend(
+        Proto.PreimageRequestWithTransfer held,
+        string transferId,
+        LightningPayment payment,
+        byte[] identityPublicKey,
+        byte[] sspIdentityPublicKey)
+    {
+        var transfer = held.Transfer;
+        if (transfer is null
+            || !string.Equals(transfer.Id, transferId, StringComparison.OrdinalIgnoreCase)
+            || transfer.Type != Proto.TransferType.PreimageSwap
+            || !held.SenderIdentityPubkey.Span.SequenceEqual(identityPublicKey)
+            || !transfer.SenderIdentityPublicKey.Span.SequenceEqual(identityPublicKey)
+            || !held.ReceiverIdentityPubkey.Span.SequenceEqual(sspIdentityPublicKey)
+            || !transfer.ReceiverIdentityPublicKey.Span.SequenceEqual(sspIdentityPublicKey))
+        {
+            throw new ArgumentException(
+                $"Transfer {transferId} is not a Lightning send from this wallet to the SSP.", nameof(transferId));
+        }
+
+        if (!held.PaymentHash.Span.SequenceEqual(payment.Invoice.PaymentHash))
+        {
+            throw new ArgumentException(
+                $"Transfer {transferId} pays another invoice (payment hash {Convert.ToHexString(held.PaymentHash.Span).ToLowerInvariant()}).",
+                nameof(transferId));
+        }
+
+        if (held.Status == Proto.PreimageRequestStatus.Returned
+            || transfer.Status is Proto.TransferStatus.Returned or Proto.TransferStatus.Expired)
+        {
+            throw new ArgumentException(
+                $"The Lightning send of transfer {transferId} failed and was returned; pay again with a new transferId.",
+                nameof(transferId));
+        }
+
+        if (transfer.TotalValue < (ulong)payment.AmountSats)
+        {
+            throw new ArgumentException(
+                $"Transfer {transferId} holds {transfer.TotalValue} sats, less than the {payment.AmountSats} sats to pay.",
+                nameof(transferId));
+        }
+
+        var feeSats = transfer.TotalValue - (ulong)payment.AmountSats;
+        if (feeSats > (ulong)payment.MaxFeeSats)
+        {
+            throw new FeeExceedsLimitException("lightning.pay", TransferMapping.ReportedSats(feeSats), payment.MaxFeeSats);
+        }
+    }
+
     /// <summary>
     /// Resolve the amount to pay: the invoice amount (rounded up to whole sats), or the caller's
     /// amount for an amountless invoice. A caller amount that contradicts the invoice is refused.
@@ -418,6 +621,15 @@ internal static class LightningValidator
         {
             throw new SparkUntrustedResponseException(
                 operation, $"The SSP reported payment hash {reportedPaymentHashHex}, which does not match ours ({expectedHex}).");
+        }
+
+        // The wallet never asks for a Spark fallback. One in the invoice would let a payer that
+        // prefers Spark pay whoever it names instead of this wallet (reference SDK: "Spark
+        // fallback address found in lightning invoice but includeSparkAddress is false").
+        if (invoice.SparkFallback is { } sparkFallback)
+        {
+            throw new SparkUntrustedResponseException(
+                operation, $"The SSP invoice carries a Spark fallback ({sparkFallback}) the wallet did not ask for.");
         }
 
         if (expectedAmountSats == 0)
