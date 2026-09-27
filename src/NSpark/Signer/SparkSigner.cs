@@ -40,9 +40,21 @@ public sealed class SparkSigner : ISparkSigner
     /// Build a <see cref="SparkSigner"/> from a BIP-39 mnemonic at the given account index
     /// and optional passphrase.
     /// </summary>
-    public static SparkSigner FromMnemonic(string mnemonic, int account = 0, string? passphrase = null)
+    /// <param name="mnemonic">The BIP-39 phrase.</param>
+    /// <param name="account">BIP-32 account index.</param>
+    /// <param name="passphrase">Optional BIP-39 passphrase.</param>
+    /// <param name="validateMnemonic">
+    /// Refuse a phrase that fails the BIP-39 wordlist or checksum (the default). Pass <c>false</c>
+    /// only for phrases known to be non-standard.
+    /// </param>
+    /// <exception cref="Exceptions.SparkConfigurationException">The mnemonic fails validation.</exception>
+    public static SparkSigner FromMnemonic(
+        string mnemonic,
+        int account = 0,
+        string? passphrase = null,
+        bool validateMnemonic = true)
     {
-        var keys = KeyDerivation.FromMnemonic(mnemonic, account, passphrase);
+        var keys = KeyDerivation.FromMnemonic(mnemonic, account, passphrase, validateMnemonic);
         return new SparkSigner(keys);
     }
 

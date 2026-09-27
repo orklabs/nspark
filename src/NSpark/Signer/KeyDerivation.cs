@@ -42,18 +42,76 @@ public sealed class KeyDerivation
     /// <summary>
     /// Derive all Spark keys from a BIP-39 mnemonic.
     /// </summary>
-    public static KeyDerivation FromMnemonic(string mnemonic, int account = 0, string? passphrase = null)
+    /// <param name="mnemonic">The BIP-39 phrase.</param>
+    /// <param name="account">BIP-32 account index, 0 to 2^31 − 1.</param>
+    /// <param name="passphrase">Optional BIP-39 passphrase.</param>
+    /// <param name="validateMnemonic">
+    /// Refuse a phrase that fails the BIP-39 English wordlist or checksum (see <see cref="Bip39"/>)
+    /// instead of silently deriving a different wallet. Pass <c>false</c> only for phrases known to
+    /// be non-standard: the seed is then derived from the phrase as BIP-39 specifies it (PBKDF2 over
+    /// its NFKD form), whatever its words, as the Swift SDK derives it.
+    /// </param>
+    /// <exception cref="Exceptions.SparkConfigurationException">
+    /// The mnemonic fails validation, or the account index is out of range.
+    /// </exception>
+    public static KeyDerivation FromMnemonic(
+        string mnemonic,
+        int account = 0,
+        string? passphrase = null,
+        bool validateMnemonic = true)
     {
-        var mnemonicObj = new Mnemonic(mnemonic);
-        var seed = mnemonicObj.DeriveSeed(passphrase);
-        return FromSeed(seed, account);
+        ArgumentNullException.ThrowIfNull(mnemonic);
+        ValidateAccount(account);
+        if (validateMnemonic)
+        {
+            Bip39.Validate(mnemonic);
+        }
+
+        var seed = MnemonicToSeed(mnemonic, passphrase);
+        try
+        {
+            return FromSeed(seed, account);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(seed);
+        }
     }
+
+    /// <summary>
+    /// The BIP-39 seed of <paramref name="mnemonic"/>. A phrase NBitcoin parses gets its seed, as
+    /// before; any other phrase (words outside the wordlist, which only an unvalidated load lets
+    /// through) gets the specification's PBKDF2-HMAC-SHA512 over the NFKD phrase with the salt
+    /// "mnemonic" + passphrase, 2048 rounds — the same seed for every phrase NBitcoin accepts.
+    /// </summary>
+    internal static byte[] MnemonicToSeed(string mnemonic, string? passphrase)
+    {
+        try
+        {
+            return new Mnemonic(mnemonic).DeriveSeed(passphrase);
+        }
+        catch (FormatException)
+        {
+            return Bip39Seed(mnemonic, passphrase);
+        }
+    }
+
+    /// <summary>BIP-39's seed function: PBKDF2-HMAC-SHA512, 2048 rounds, over the NFKD phrase and "mnemonic" + passphrase.</summary>
+    internal static byte[] Bip39Seed(string mnemonic, string? passphrase) =>
+        Rfc2898DeriveBytes.Pbkdf2(
+            Encoding.UTF8.GetBytes(mnemonic.Normalize(NormalizationForm.FormKD)),
+            Encoding.UTF8.GetBytes(("mnemonic" + (passphrase ?? string.Empty)).Normalize(NormalizationForm.FormKD)),
+            2048,
+            HashAlgorithmName.SHA512,
+            64);
 
     /// <summary>
     /// Derive all Spark keys from a raw seed.
     /// </summary>
+    /// <exception cref="Exceptions.SparkConfigurationException">The account index is out of range.</exception>
     public static KeyDerivation FromSeed(byte[] seed, int account = 0)
     {
+        ValidateAccount(account);
         var master = ExtKey.CreateFromSeed(seed);
 
         // m/8797555'/{account}'
@@ -68,6 +126,16 @@ public sealed class KeyDerivation
             staticDeposit: accountKey.Derive(3, hardened: true),
             htlcPreimage: accountKey.Derive(4, hardened: true)
         );
+    }
+
+    /// <summary>A hardened BIP-32 index: 0 to 2^31 − 1.</summary>
+    private static void ValidateAccount(int account)
+    {
+        if (account < 0)
+        {
+            throw new Exceptions.SparkConfigurationException(
+                "mnemonic.account", $"The account index must be between 0 and 2^31-1, got {account}.");
+        }
     }
 
     /// <summary>
