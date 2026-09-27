@@ -1,27 +1,4 @@
 #nullable enable
-abstract NSpark.Models.SparkEvent.<Clone>$() -> NSpark.Models.SparkEvent!
-const NSpark.Connection.SparkResiliencePolicies.DefaultMaxRetries = 3 -> int
-const NSpark.Diagnostics.SparkActivitySource.Name = "NSpark" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.DepositClaim = "nspark.deposit.claim" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.FrostSign = "nspark.frost.sign" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.LightningInvoiceCreate = "nspark.lightning.invoice.create" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.LightningInvoicePay = "nspark.lightning.invoice.pay" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.SoAuthenticate = "nspark.so.authenticate" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.SoGrpcCall = "nspark.so.grpc.call" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.SspGraphQLCall = "nspark.ssp.graphql.call" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.TransferClaim = "nspark.transfer.claim" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.TransferSend = "nspark.transfer.send" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Spans.WithdrawalInitiate = "nspark.withdrawal.initiate" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.GrpcStatus = "nspark.grpc.status" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.InvoicePaymentHash = "nspark.invoice.payment_hash" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.Network = "nspark.network" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.PaymentAmountSats = "nspark.payment.amount_sats" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.SoAddress = "nspark.so.address" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.SspOperation = "nspark.ssp.operation" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.TransferId = "nspark.transfer.id" -> string!
-const NSpark.Diagnostics.SparkActivitySource.Tags.WalletId = "nspark.wallet.id" -> string!
-const NSpark.Diagnostics.SparkMeter.Name = "NSpark" -> string!
-const NSpark.Signer.KeyDerivation.SparkPurpose = 8797555 -> int
 NSpark.Connection.SparkResiliencePolicies
 NSpark.Diagnostics.LogEvents
 NSpark.Diagnostics.Sensitive<T>
@@ -100,6 +77,13 @@ NSpark.Exceptions.SparkLightningSendIncompleteException.TransferId.get -> string
 NSpark.Exceptions.SparkSignerException
 NSpark.Exceptions.SparkSignerException.SparkSignerException(string! operation, string! message) -> void
 NSpark.Exceptions.SparkSignerException.SparkSignerException(string! operation, string! message, System.Exception! innerException) -> void
+NSpark.Exceptions.SparkSspException
+NSpark.Exceptions.SparkSspException.GraphQLErrors.get -> System.Collections.Generic.IReadOnlyList<string!>!
+NSpark.Exceptions.SparkSspException.GraphQLErrors.init -> void
+NSpark.Exceptions.SparkSspException.HttpStatusCode.get -> int?
+NSpark.Exceptions.SparkSspException.HttpStatusCode.init -> void
+NSpark.Exceptions.SparkSspException.SparkSspException(string! operation, string! message) -> void
+NSpark.Exceptions.SparkSspException.SparkSspException(string! operation, string! message, System.Exception! innerException) -> void
 NSpark.Exceptions.SparkTransferException
 NSpark.Exceptions.SparkTransferException.SparkTransferException(string! operation, string! message) -> void
 NSpark.Exceptions.SparkTransferException.SparkTransferException(string! operation, string! message, System.Exception! innerException) -> void
@@ -192,6 +176,38 @@ NSpark.Models.LightningSendStatus.Preimage.get -> string?
 NSpark.Models.LightningSendStatus.Preimage.init -> void
 NSpark.Models.LightningSendStatus.Status.get -> string!
 NSpark.Models.LightningSendStatus.Status.init -> void
+NSpark.Models.PendingTransferClaim
+NSpark.Models.PendingTransferClaim.<Clone>$() -> NSpark.Models.PendingTransferClaim!
+NSpark.Models.PendingTransferClaim.ClaimedTransferIds.get -> System.Collections.Generic.IReadOnlyList<string!>!
+NSpark.Models.PendingTransferClaim.ClaimedTransfers.get -> System.Collections.Generic.IReadOnlyList<NSpark.Models.SparkTransfer!>!
+NSpark.Models.PendingTransferClaim.ClaimedTransfers.init -> void
+NSpark.Models.PendingTransferClaim.Count.get -> int
+NSpark.Models.PendingTransferClaim.Deconstruct(out System.Collections.Generic.IReadOnlyList<NSpark.Models.SparkTransfer!>! ClaimedTransfers, out System.Collections.Generic.IReadOnlyList<NSpark.Models.PendingTransferClaimFailure!>! Failures) -> void
+NSpark.Models.PendingTransferClaim.Equals(NSpark.Models.PendingTransferClaim? other) -> bool
+NSpark.Models.PendingTransferClaim.Failures.get -> System.Collections.Generic.IReadOnlyList<NSpark.Models.PendingTransferClaimFailure!>!
+NSpark.Models.PendingTransferClaim.Failures.init -> void
+NSpark.Models.PendingTransferClaim.GetEnumerator() -> System.Collections.Generic.IEnumerator<NSpark.Models.SparkTransfer!>!
+NSpark.Models.PendingTransferClaim.PendingTransferClaim(System.Collections.Generic.IReadOnlyList<NSpark.Models.SparkTransfer!>! ClaimedTransfers, System.Collections.Generic.IReadOnlyList<NSpark.Models.PendingTransferClaimFailure!>! Failures) -> void
+NSpark.Models.PendingTransferClaim.this[int index].get -> NSpark.Models.SparkTransfer!
+NSpark.Models.PendingTransferClaimFailure
+NSpark.Models.PendingTransferClaimFailure.<Clone>$() -> NSpark.Models.PendingTransferClaimFailure!
+NSpark.Models.PendingTransferClaimFailure.Deconstruct(out string! TransferId, out System.Exception! Error) -> void
+NSpark.Models.PendingTransferClaimFailure.Equals(NSpark.Models.PendingTransferClaimFailure? other) -> bool
+NSpark.Models.PendingTransferClaimFailure.Error.get -> System.Exception!
+NSpark.Models.PendingTransferClaimFailure.Error.init -> void
+NSpark.Models.PendingTransferClaimFailure.PendingTransferClaimFailure(string! TransferId, System.Exception! Error) -> void
+NSpark.Models.PendingTransferClaimFailure.TransferId.get -> string!
+NSpark.Models.PendingTransferClaimFailure.TransferId.init -> void
+NSpark.Models.ReconnectingEvent
+NSpark.Models.ReconnectingEvent.Attempt.get -> int
+NSpark.Models.ReconnectingEvent.Attempt.init -> void
+NSpark.Models.ReconnectingEvent.Deconstruct(out int Attempt, out System.TimeSpan RetryIn, out string! Reason) -> void
+NSpark.Models.ReconnectingEvent.Equals(NSpark.Models.ReconnectingEvent? other) -> bool
+NSpark.Models.ReconnectingEvent.Reason.get -> string!
+NSpark.Models.ReconnectingEvent.Reason.init -> void
+NSpark.Models.ReconnectingEvent.ReconnectingEvent(int Attempt, System.TimeSpan RetryIn, string! Reason) -> void
+NSpark.Models.ReconnectingEvent.RetryIn.get -> System.TimeSpan
+NSpark.Models.ReconnectingEvent.RetryIn.init -> void
 NSpark.Models.SatsBalance
 NSpark.Models.SatsBalance.<Clone>$() -> NSpark.Models.SatsBalance!
 NSpark.Models.SatsBalance.Available.get -> long
@@ -215,6 +231,7 @@ NSpark.Models.SparkLeaf.Deconstruct(out string! Id, out string! TreeId, out long
 NSpark.Models.SparkLeaf.Equals(NSpark.Models.SparkLeaf? other) -> bool
 NSpark.Models.SparkLeaf.Id.get -> string!
 NSpark.Models.SparkLeaf.Id.init -> void
+NSpark.Models.SparkLeaf.IsFrozen.get -> bool
 NSpark.Models.SparkLeaf.IsRenewable.get -> bool
 NSpark.Models.SparkLeaf.IsSpendable.get -> bool
 NSpark.Models.SparkLeaf.RefundTimelockBlocks.get -> uint
@@ -302,6 +319,8 @@ NSpark.Models.SparkTransfer.ReceiverIdentityPublicKey.get -> string!
 NSpark.Models.SparkTransfer.ReceiverIdentityPublicKey.init -> void
 NSpark.Models.SparkTransfer.SenderIdentityPublicKey.get -> string!
 NSpark.Models.SparkTransfer.SenderIdentityPublicKey.init -> void
+NSpark.Models.SparkTransfer.SparkInvoice.get -> string?
+NSpark.Models.SparkTransfer.SparkInvoice.init -> void
 NSpark.Models.SparkTransfer.SparkTransfer(string! Id, string! SenderIdentityPublicKey, string! ReceiverIdentityPublicKey, long TotalValueSats, string! Status, System.DateTimeOffset CreatedAt, string? Type = null) -> void
 NSpark.Models.SparkTransfer.Status.get -> string!
 NSpark.Models.SparkTransfer.Status.init -> void
@@ -405,6 +424,12 @@ NSpark.Models.TransferReceivedEvent.Equals(NSpark.Models.TransferReceivedEvent? 
 NSpark.Models.TransferReceivedEvent.Transfer.get -> NSpark.Models.SparkTransfer!
 NSpark.Models.TransferReceivedEvent.Transfer.init -> void
 NSpark.Models.TransferReceivedEvent.TransferReceivedEvent(NSpark.Models.SparkTransfer! Transfer) -> void
+NSpark.Models.TransferSentEvent
+NSpark.Models.TransferSentEvent.Deconstruct(out NSpark.Models.SparkTransfer! Transfer) -> void
+NSpark.Models.TransferSentEvent.Equals(NSpark.Models.TransferSentEvent? other) -> bool
+NSpark.Models.TransferSentEvent.Transfer.get -> NSpark.Models.SparkTransfer!
+NSpark.Models.TransferSentEvent.Transfer.init -> void
+NSpark.Models.TransferSentEvent.TransferSentEvent(NSpark.Models.SparkTransfer! Transfer) -> void
 NSpark.Models.UnusedDepositAddress
 NSpark.Models.UnusedDepositAddress.<Clone>$() -> NSpark.Models.UnusedDepositAddress!
 NSpark.Models.UnusedDepositAddress.Address.get -> string!
@@ -441,6 +466,48 @@ NSpark.Models.WalletSettings.OwnerIdentityPublicKeyHex.init -> void
 NSpark.Models.WalletSettings.PrivateEnabled.get -> bool
 NSpark.Models.WalletSettings.PrivateEnabled.init -> void
 NSpark.Models.WalletSettings.WalletSettings(string! OwnerIdentityPublicKeyHex, bool PrivateEnabled, string? MasterIdentityPublicKeyHex = null) -> void
+NSpark.Models.WithdrawAllQuote
+NSpark.Models.WithdrawAllQuote.<Clone>$() -> NSpark.Models.WithdrawAllQuote!
+NSpark.Models.WithdrawAllQuote.CoversFee.get -> bool
+NSpark.Models.WithdrawAllQuote.Deconstruct(out long SpendableSats, out long QuotedFeeSats, out long FrozenSats, out long UnrenewedSats, out long LockedSats, out long IncomingSats, out int LeafCount) -> void
+NSpark.Models.WithdrawAllQuote.Equals(NSpark.Models.WithdrawAllQuote? other) -> bool
+NSpark.Models.WithdrawAllQuote.EstimatedPayoutSats.get -> long
+NSpark.Models.WithdrawAllQuote.FrozenFraction.get -> double
+NSpark.Models.WithdrawAllQuote.FrozenSats.get -> long
+NSpark.Models.WithdrawAllQuote.FrozenSats.init -> void
+NSpark.Models.WithdrawAllQuote.IncomingSats.get -> long
+NSpark.Models.WithdrawAllQuote.IncomingSats.init -> void
+NSpark.Models.WithdrawAllQuote.LeafCount.get -> int
+NSpark.Models.WithdrawAllQuote.LeafCount.init -> void
+NSpark.Models.WithdrawAllQuote.LockedSats.get -> long
+NSpark.Models.WithdrawAllQuote.LockedSats.init -> void
+NSpark.Models.WithdrawAllQuote.QuotedFeeSats.get -> long
+NSpark.Models.WithdrawAllQuote.QuotedFeeSats.init -> void
+NSpark.Models.WithdrawAllQuote.SpendableSats.get -> long
+NSpark.Models.WithdrawAllQuote.SpendableSats.init -> void
+NSpark.Models.WithdrawAllQuote.UnrenewedSats.get -> long
+NSpark.Models.WithdrawAllQuote.UnrenewedSats.init -> void
+NSpark.Models.WithdrawAllQuote.WithdrawAllQuote(long SpendableSats, long QuotedFeeSats, long FrozenSats, long UnrenewedSats, long LockedSats, long IncomingSats, int LeafCount) -> void
+NSpark.Models.WithdrawAllResult
+NSpark.Models.WithdrawAllResult.<Clone>$() -> NSpark.Models.WithdrawAllResult!
+NSpark.Models.WithdrawAllResult.Deconstruct(out string! Txid, out long SentSats, out long PayoutSats, out long FrozenSats, out long UnrenewedSats, out long LockedSats, out long UnclaimedSats) -> void
+NSpark.Models.WithdrawAllResult.Equals(NSpark.Models.WithdrawAllResult? other) -> bool
+NSpark.Models.WithdrawAllResult.FeeSats.get -> long
+NSpark.Models.WithdrawAllResult.FrozenSats.get -> long
+NSpark.Models.WithdrawAllResult.FrozenSats.init -> void
+NSpark.Models.WithdrawAllResult.LockedSats.get -> long
+NSpark.Models.WithdrawAllResult.LockedSats.init -> void
+NSpark.Models.WithdrawAllResult.PayoutSats.get -> long
+NSpark.Models.WithdrawAllResult.PayoutSats.init -> void
+NSpark.Models.WithdrawAllResult.SentSats.get -> long
+NSpark.Models.WithdrawAllResult.SentSats.init -> void
+NSpark.Models.WithdrawAllResult.Txid.get -> string!
+NSpark.Models.WithdrawAllResult.Txid.init -> void
+NSpark.Models.WithdrawAllResult.UnclaimedSats.get -> long
+NSpark.Models.WithdrawAllResult.UnclaimedSats.init -> void
+NSpark.Models.WithdrawAllResult.UnrenewedSats.get -> long
+NSpark.Models.WithdrawAllResult.UnrenewedSats.init -> void
+NSpark.Models.WithdrawAllResult.WithdrawAllResult(string! Txid, long SentSats, long PayoutSats, long FrozenSats, long UnrenewedSats, long LockedSats, long UnclaimedSats) -> void
 NSpark.ServiceCollectionExtensions
 NSpark.Services.BalanceService
 NSpark.Services.Bech32mHelper
@@ -487,6 +554,10 @@ NSpark.Services.SparkTxBuilder
 NSpark.Services.SwapService
 NSpark.Services.TokenIdentifier
 NSpark.Services.TokenService
+NSpark.Services.TransferDirection
+NSpark.Services.TransferDirection.Both = 0 -> NSpark.Services.TransferDirection
+NSpark.Services.TransferDirection.Received = 2 -> NSpark.Services.TransferDirection
+NSpark.Services.TransferDirection.Sent = 1 -> NSpark.Services.TransferDirection
 NSpark.Services.TransferService
 NSpark.Services.WithdrawalService
 NSpark.Signer.AdaptorKeyHandle
@@ -498,6 +569,7 @@ NSpark.Signer.AdaptorKeyHandle.Handle.get -> byte[]!
 NSpark.Signer.AdaptorKeyHandle.Handle.init -> void
 NSpark.Signer.AdaptorKeyHandle.PublicKey.get -> byte[]!
 NSpark.Signer.AdaptorKeyHandle.PublicKey.init -> void
+NSpark.Signer.Bip39
 NSpark.Signer.ClaimTweakLeafDescriptor
 NSpark.Signer.ClaimTweakLeafDescriptor.<Clone>$() -> NSpark.Signer.ClaimTweakLeafDescriptor!
 NSpark.Signer.ClaimTweakLeafDescriptor.ClaimTweakLeafDescriptor(string! LeafId, byte[]! SenderSecretCipher) -> void
@@ -654,6 +726,7 @@ NSpark.SparkNetwork.Mainnet = 0 -> NSpark.SparkNetwork
 NSpark.SparkNetwork.Regtest = 1 -> NSpark.SparkNetwork
 NSpark.SparkOptions
 NSpark.SparkOptions.EffectiveSigningThreshold.get -> uint
+NSpark.SparkOptions.EffectiveSspIdentityPublicKeyHex.get -> string?
 NSpark.SparkOptions.ExpectedWithdrawBondSats.get -> ulong
 NSpark.SparkOptions.ExpectedWithdrawBondSats.set -> void
 NSpark.SparkOptions.ExpectedWithdrawRelativeBlockLocktime.get -> ulong
@@ -666,19 +739,49 @@ NSpark.SparkOptions.SigningOperators.set -> void
 NSpark.SparkOptions.SigningThreshold.get -> uint?
 NSpark.SparkOptions.SigningThreshold.set -> void
 NSpark.SparkOptions.SparkOptions() -> void
-NSpark.SparkOptions.SspIdentityPublicKeyHex.get -> string!
+NSpark.SparkOptions.SspIdentityPublicKeyHex.get -> string?
 NSpark.SparkOptions.SspIdentityPublicKeyHex.set -> void
 NSpark.SparkOptions.SspUrl.get -> string!
 NSpark.SparkOptions.SspUrl.set -> void
+NSpark.SparkOptions.TokenTransactionVersion.get -> NSpark.TokenTransactionVersion
+NSpark.SparkOptions.TokenTransactionVersion.set -> void
 NSpark.SparkWallet
 NSpark.SparkWallet.DepositPublicKey.get -> byte[]!
 NSpark.SparkWallet.GetSparkAddress() -> string!
 NSpark.SparkWallet.IdentityPublicKey.get -> byte[]!
 NSpark.SparkWallet.IdentityPublicKeyHex.get -> string!
+NSpark.TokenTransactionVersion
+NSpark.TokenTransactionVersion.V2 = 1 -> NSpark.TokenTransactionVersion
+NSpark.TokenTransactionVersion.V3 = 0 -> NSpark.TokenTransactionVersion
+abstract NSpark.Models.SparkEvent.<Clone>$() -> NSpark.Models.SparkEvent!
+const NSpark.Connection.SparkResiliencePolicies.DefaultMaxRetries = 3 -> int
+const NSpark.Diagnostics.SparkActivitySource.Name = "NSpark" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.DepositClaim = "nspark.deposit.claim" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.FrostSign = "nspark.frost.sign" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.LightningInvoiceCreate = "nspark.lightning.invoice.create" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.LightningInvoicePay = "nspark.lightning.invoice.pay" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.SoAuthenticate = "nspark.so.authenticate" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.SoGrpcCall = "nspark.so.grpc.call" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.SspGraphQLCall = "nspark.ssp.graphql.call" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.TransferClaim = "nspark.transfer.claim" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.TransferSend = "nspark.transfer.send" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Spans.WithdrawalInitiate = "nspark.withdrawal.initiate" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.GrpcStatus = "nspark.grpc.status" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.InvoicePaymentHash = "nspark.invoice.payment_hash" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.Network = "nspark.network" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.PaymentAmountSats = "nspark.payment.amount_sats" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.SoAddress = "nspark.so.address" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.SspOperation = "nspark.ssp.operation" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.TransferId = "nspark.transfer.id" -> string!
+const NSpark.Diagnostics.SparkActivitySource.Tags.WalletId = "nspark.wallet.id" -> string!
+const NSpark.Diagnostics.SparkMeter.Name = "NSpark" -> string!
+const NSpark.Signer.KeyDerivation.SparkPurpose = 8797555 -> int
+const NSpark.SparkOptions.DefaultSspUrl = "https://api.lightspark.com/graphql/spark/2025-03-19" -> string!
 override NSpark.Diagnostics.Sensitive<T>.Equals(object? obj) -> bool
 override NSpark.Diagnostics.Sensitive<T>.GetHashCode() -> int
 override NSpark.Diagnostics.Sensitive<T>.ToString() -> string!
 override NSpark.Exceptions.SparkConnectionException.IsRetryable.get -> bool
+override NSpark.Exceptions.SparkSspException.IsRetryable.get -> bool
 override NSpark.Models.ConnectedEvent.<Clone>$() -> NSpark.Models.ConnectedEvent!
 override NSpark.Models.ConnectedEvent.Equals(object? obj) -> bool
 override NSpark.Models.ConnectedEvent.GetHashCode() -> int
@@ -705,6 +808,16 @@ override NSpark.Models.LightningInvoice.ToString() -> string!
 override NSpark.Models.LightningSendStatus.Equals(object? obj) -> bool
 override NSpark.Models.LightningSendStatus.GetHashCode() -> int
 override NSpark.Models.LightningSendStatus.ToString() -> string!
+override NSpark.Models.PendingTransferClaim.Equals(object? obj) -> bool
+override NSpark.Models.PendingTransferClaim.GetHashCode() -> int
+override NSpark.Models.PendingTransferClaim.ToString() -> string!
+override NSpark.Models.PendingTransferClaimFailure.Equals(object? obj) -> bool
+override NSpark.Models.PendingTransferClaimFailure.GetHashCode() -> int
+override NSpark.Models.PendingTransferClaimFailure.ToString() -> string!
+override NSpark.Models.ReconnectingEvent.<Clone>$() -> NSpark.Models.ReconnectingEvent!
+override NSpark.Models.ReconnectingEvent.Equals(object? obj) -> bool
+override NSpark.Models.ReconnectingEvent.GetHashCode() -> int
+override NSpark.Models.ReconnectingEvent.ToString() -> string!
 override NSpark.Models.SatsBalance.Equals(object? obj) -> bool
 override NSpark.Models.SatsBalance.GetHashCode() -> int
 override NSpark.Models.SatsBalance.ToString() -> string!
@@ -757,6 +870,10 @@ override NSpark.Models.TransferReceivedEvent.<Clone>$() -> NSpark.Models.Transfe
 override NSpark.Models.TransferReceivedEvent.Equals(object? obj) -> bool
 override NSpark.Models.TransferReceivedEvent.GetHashCode() -> int
 override NSpark.Models.TransferReceivedEvent.ToString() -> string!
+override NSpark.Models.TransferSentEvent.<Clone>$() -> NSpark.Models.TransferSentEvent!
+override NSpark.Models.TransferSentEvent.Equals(object? obj) -> bool
+override NSpark.Models.TransferSentEvent.GetHashCode() -> int
+override NSpark.Models.TransferSentEvent.ToString() -> string!
 override NSpark.Models.UnusedDepositAddress.Equals(object? obj) -> bool
 override NSpark.Models.UnusedDepositAddress.GetHashCode() -> int
 override NSpark.Models.UnusedDepositAddress.ToString() -> string!
@@ -766,6 +883,12 @@ override NSpark.Models.WalletBalance.ToString() -> string!
 override NSpark.Models.WalletSettings.Equals(object? obj) -> bool
 override NSpark.Models.WalletSettings.GetHashCode() -> int
 override NSpark.Models.WalletSettings.ToString() -> string!
+override NSpark.Models.WithdrawAllQuote.Equals(object? obj) -> bool
+override NSpark.Models.WithdrawAllQuote.GetHashCode() -> int
+override NSpark.Models.WithdrawAllQuote.ToString() -> string!
+override NSpark.Models.WithdrawAllResult.Equals(object? obj) -> bool
+override NSpark.Models.WithdrawAllResult.GetHashCode() -> int
+override NSpark.Models.WithdrawAllResult.ToString() -> string!
 override NSpark.Services.SparkBitcoinTx.Equals(object? obj) -> bool
 override NSpark.Services.SparkBitcoinTx.GetHashCode() -> int
 override NSpark.Services.SparkBitcoinTx.ToString() -> string!
@@ -810,7 +933,9 @@ override NSpark.SigningOperatorConfig.GetHashCode() -> int
 override NSpark.SigningOperatorConfig.ToString() -> string!
 override sealed NSpark.Models.ConnectedEvent.Equals(NSpark.Models.SparkEvent? other) -> bool
 override sealed NSpark.Models.DepositConfirmedEvent.Equals(NSpark.Models.SparkEvent? other) -> bool
+override sealed NSpark.Models.ReconnectingEvent.Equals(NSpark.Models.SparkEvent? other) -> bool
 override sealed NSpark.Models.TransferReceivedEvent.Equals(NSpark.Models.SparkEvent? other) -> bool
+override sealed NSpark.Models.TransferSentEvent.Equals(NSpark.Models.SparkEvent? other) -> bool
 static NSpark.Connection.SparkResiliencePolicies.Build() -> Polly.ResiliencePipeline!
 static NSpark.Connection.SparkResiliencePolicies.Build(System.TimeSpan timeout, int maxRetries) -> Polly.ResiliencePipeline!
 static NSpark.Diagnostics.Sensitive<T>.implicit operator NSpark.Diagnostics.Sensitive<T>(T value) -> NSpark.Diagnostics.Sensitive<T>
@@ -836,6 +961,12 @@ static NSpark.Models.LightningInvoice.operator !=(NSpark.Models.LightningInvoice
 static NSpark.Models.LightningInvoice.operator ==(NSpark.Models.LightningInvoice? left, NSpark.Models.LightningInvoice? right) -> bool
 static NSpark.Models.LightningSendStatus.operator !=(NSpark.Models.LightningSendStatus? left, NSpark.Models.LightningSendStatus? right) -> bool
 static NSpark.Models.LightningSendStatus.operator ==(NSpark.Models.LightningSendStatus? left, NSpark.Models.LightningSendStatus? right) -> bool
+static NSpark.Models.PendingTransferClaim.operator !=(NSpark.Models.PendingTransferClaim? left, NSpark.Models.PendingTransferClaim? right) -> bool
+static NSpark.Models.PendingTransferClaim.operator ==(NSpark.Models.PendingTransferClaim? left, NSpark.Models.PendingTransferClaim? right) -> bool
+static NSpark.Models.PendingTransferClaimFailure.operator !=(NSpark.Models.PendingTransferClaimFailure? left, NSpark.Models.PendingTransferClaimFailure? right) -> bool
+static NSpark.Models.PendingTransferClaimFailure.operator ==(NSpark.Models.PendingTransferClaimFailure? left, NSpark.Models.PendingTransferClaimFailure? right) -> bool
+static NSpark.Models.ReconnectingEvent.operator !=(NSpark.Models.ReconnectingEvent? left, NSpark.Models.ReconnectingEvent? right) -> bool
+static NSpark.Models.ReconnectingEvent.operator ==(NSpark.Models.ReconnectingEvent? left, NSpark.Models.ReconnectingEvent? right) -> bool
 static NSpark.Models.SatsBalance.operator !=(NSpark.Models.SatsBalance? left, NSpark.Models.SatsBalance? right) -> bool
 static NSpark.Models.SatsBalance.operator ==(NSpark.Models.SatsBalance? left, NSpark.Models.SatsBalance? right) -> bool
 static NSpark.Models.SparkEvent.operator !=(NSpark.Models.SparkEvent? left, NSpark.Models.SparkEvent? right) -> bool
@@ -870,29 +1001,39 @@ static NSpark.Models.TransferPage.operator !=(NSpark.Models.TransferPage? left, 
 static NSpark.Models.TransferPage.operator ==(NSpark.Models.TransferPage? left, NSpark.Models.TransferPage? right) -> bool
 static NSpark.Models.TransferReceivedEvent.operator !=(NSpark.Models.TransferReceivedEvent? left, NSpark.Models.TransferReceivedEvent? right) -> bool
 static NSpark.Models.TransferReceivedEvent.operator ==(NSpark.Models.TransferReceivedEvent? left, NSpark.Models.TransferReceivedEvent? right) -> bool
+static NSpark.Models.TransferSentEvent.operator !=(NSpark.Models.TransferSentEvent? left, NSpark.Models.TransferSentEvent? right) -> bool
+static NSpark.Models.TransferSentEvent.operator ==(NSpark.Models.TransferSentEvent? left, NSpark.Models.TransferSentEvent? right) -> bool
 static NSpark.Models.UnusedDepositAddress.operator !=(NSpark.Models.UnusedDepositAddress? left, NSpark.Models.UnusedDepositAddress? right) -> bool
 static NSpark.Models.UnusedDepositAddress.operator ==(NSpark.Models.UnusedDepositAddress? left, NSpark.Models.UnusedDepositAddress? right) -> bool
 static NSpark.Models.WalletBalance.operator !=(NSpark.Models.WalletBalance? left, NSpark.Models.WalletBalance? right) -> bool
 static NSpark.Models.WalletBalance.operator ==(NSpark.Models.WalletBalance? left, NSpark.Models.WalletBalance? right) -> bool
 static NSpark.Models.WalletSettings.operator !=(NSpark.Models.WalletSettings? left, NSpark.Models.WalletSettings? right) -> bool
 static NSpark.Models.WalletSettings.operator ==(NSpark.Models.WalletSettings? left, NSpark.Models.WalletSettings? right) -> bool
+static NSpark.Models.WithdrawAllQuote.operator !=(NSpark.Models.WithdrawAllQuote? left, NSpark.Models.WithdrawAllQuote? right) -> bool
+static NSpark.Models.WithdrawAllQuote.operator ==(NSpark.Models.WithdrawAllQuote? left, NSpark.Models.WithdrawAllQuote? right) -> bool
+static NSpark.Models.WithdrawAllResult.operator !=(NSpark.Models.WithdrawAllResult? left, NSpark.Models.WithdrawAllResult? right) -> bool
+static NSpark.Models.WithdrawAllResult.operator ==(NSpark.Models.WithdrawAllResult? left, NSpark.Models.WithdrawAllResult? right) -> bool
 static NSpark.ServiceCollectionExtensions.AddSpark(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, System.Action<NSpark.SparkOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
 static NSpark.Services.BalanceService.GetBalanceAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.WalletBalance!>!
 static NSpark.Services.BalanceService.GetLeavesAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.SparkLeaf!>!>!
 static NSpark.Services.BalanceService.GetSpendableLeavesAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.SparkLeaf!>!>!
 static NSpark.Services.Bech32mHelper.Decode(string! bech32m, int limit = 90) -> (string! Hrp, byte[]! Data)
 static NSpark.Services.Bech32mHelper.Encode(string! hrp, byte[]! data) -> string!
-static NSpark.Services.ClaimService.ClaimPendingTransfersAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.SparkTransfer!>!>!
+static NSpark.Services.ClaimService.ClaimPendingTransfersAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.PendingTransferClaim!>!
 static NSpark.Services.ConsolidationService.ConsolidateLeavesAsync(this NSpark.SparkWallet! wallet, int maxLeavesPerRound = 100, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.SparkLeafConsolidation!>!
 static NSpark.Services.DepositService.BroadcastTransactionAsync(this NSpark.SparkWallet! wallet, string! txHex, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
-static NSpark.Services.DepositService.ClaimDepositAsync(this NSpark.SparkWallet! wallet, string! depositTxId, uint vout = 0, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
-static NSpark.Services.DepositService.ClaimStaticDepositAsync(this NSpark.SparkWallet! wallet, string! transactionId, uint outputIndex = 0, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
+static NSpark.Services.DepositService.ClaimDepositAsync(this NSpark.SparkWallet! wallet, string! depositTxId, uint? vout = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+static NSpark.Services.DepositService.ClaimStaticDepositAsync(this NSpark.SparkWallet! wallet, string! transactionId, NSpark.Models.DepositFeeEstimate! quote, uint? outputIndex = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
+static NSpark.Services.DepositService.ClaimStaticDepositAsync(this NSpark.SparkWallet! wallet, string! transactionId, uint? outputIndex = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
+static NSpark.Services.DepositService.ClaimStaticDepositWithMaxFeeAsync(this NSpark.SparkWallet! wallet, string! transactionId, long maxFee, uint? outputIndex = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string?>!
 static NSpark.Services.DepositService.GetDepositAddressAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.DepositAddress!>!
-static NSpark.Services.DepositService.GetDepositFeeEstimateAsync(this NSpark.SparkWallet! wallet, string! transactionId, uint outputIndex = 0, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.DepositFeeEstimate!>!
+static NSpark.Services.DepositService.GetDepositFeeEstimateAsync(this NSpark.SparkWallet! wallet, string! transactionId, uint? outputIndex = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.DepositFeeEstimate!>!
 static NSpark.Services.DepositService.GetStaticDepositAddressAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.StaticDepositAddress!>!
 static NSpark.Services.DepositService.GetUtxosForDepositAddressAsync(this NSpark.SparkWallet! wallet, string! address, bool excludeClaimed = true, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.DepositUtxo!>!>!
+static NSpark.Services.DepositService.QueryStaticDepositAddressesAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.StaticDepositAddress!>!>!
 static NSpark.Services.DepositService.QueryUnusedDepositAddressesAsync(this NSpark.SparkWallet! wallet, int limit = 100, int offset = 0, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.UnusedDepositAddress!>!>!
-static NSpark.Services.DepositService.RefundStaticDepositAsync(this NSpark.SparkWallet! wallet, string! depositTransactionId, string! destinationAddress, ulong satsPerVbyte, uint outputIndex = 0, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
+static NSpark.Services.DepositService.RefundAndBroadcastStaticDepositAsync(this NSpark.SparkWallet! wallet, string! depositTransactionId, string! destinationAddress, ulong satsPerVbyte, uint? outputIndex = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
+static NSpark.Services.DepositService.RefundStaticDepositAsync(this NSpark.SparkWallet! wallet, string! depositTransactionId, string! destinationAddress, ulong satsPerVbyte, uint? outputIndex = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
 static NSpark.Services.EventService.SubscribeEventsAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Collections.Generic.IAsyncEnumerable<NSpark.Models.SparkEvent!>!
 static NSpark.Services.LightningAddressService.PayLightningAddressAsync(this NSpark.SparkWallet! wallet, string! lightningAddress, long amountSats, long maxFeeSats, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
 static NSpark.Services.LightningAddressService.ResolveLightningAddressAsync(this NSpark.SparkWallet! wallet, string! lightningAddress, long amountSats, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
@@ -905,7 +1046,9 @@ static NSpark.Services.PrivacyService.GetWalletSettingsAsync(this NSpark.SparkWa
 static NSpark.Services.PrivacyService.SetPrivacyEnabledAsync(this NSpark.SparkWallet! wallet, bool enabled, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.WalletSettings!>!
 static NSpark.Services.RecoveryService.GetRecoverySnapshotAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.SparkRecoverySnapshot!>!
 static NSpark.Services.RenewalService.RenewExhaustedLeavesAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.SparkLeafRenewal!>!
+static NSpark.Services.SparkAddress.Decode(string! sparkAddress, NSpark.SparkNetwork network) -> byte[]!
 static NSpark.Services.SparkAddress.DecodeIdentityPublicKey(string! sparkAddress) -> byte[]!
+static NSpark.Services.SparkAddress.Encode(byte[]! identityPublicKey, NSpark.SparkNetwork network) -> string!
 static NSpark.Services.SparkBitcoinTx.operator !=(NSpark.Services.SparkBitcoinTx? left, NSpark.Services.SparkBitcoinTx? right) -> bool
 static NSpark.Services.SparkBitcoinTx.operator ==(NSpark.Services.SparkBitcoinTx? left, NSpark.Services.SparkBitcoinTx? right) -> bool
 static NSpark.Services.SparkNodeTxPair.operator !=(NSpark.Services.SparkNodeTxPair? left, NSpark.Services.SparkNodeTxPair? right) -> bool
@@ -930,12 +1073,17 @@ static NSpark.Services.TokenService.MintTokensAsync(this NSpark.SparkWallet! wal
 static NSpark.Services.TokenService.QueryTokenMetadataAsync(this NSpark.SparkWallet! wallet, System.Collections.Generic.IReadOnlyList<string!>? bech32mTokenIdentifiers = null, System.Collections.Generic.IReadOnlyList<byte[]!>? issuerPublicKeys = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.TokenMetadata!>!>!
 static NSpark.Services.TokenService.TransferTokensAsync(this NSpark.SparkWallet! wallet, string! bech32mTokenIdentifier, System.UInt128 amount, string! receiverSparkAddress, NSpark.Models.TokenSelectionStrategy strategy = NSpark.Models.TokenSelectionStrategy.SmallFirst, string? idempotencyKey = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.TokenTransferResult!>!
 static NSpark.Services.TransferService.GetTransferAsync(this NSpark.SparkWallet! wallet, string! transferId, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.SparkTransfer?>!
-static NSpark.Services.TransferService.GetTransfersAsync(this NSpark.SparkWallet! wallet, int limit = 100, long offset = 0, System.DateTimeOffset? createdAfter = null, System.DateTimeOffset? createdBefore = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.TransferPage!>!
+static NSpark.Services.TransferService.GetTransfersAsync(this NSpark.SparkWallet! wallet, int limit = 100, long offset = 0, System.DateTimeOffset? createdAfter = null, System.DateTimeOffset? createdBefore = null, NSpark.Services.TransferDirection direction = NSpark.Services.TransferDirection.Both, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.TransferPage!>!
 static NSpark.Services.TransferService.SendAsync(this NSpark.SparkWallet! wallet, byte[]! receiverIdentityPublicKey, long amountSats, string? transferId = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.SparkTransfer!>!
+static NSpark.Services.TransferService.SendAsync(this NSpark.SparkWallet! wallet, string! receiverSparkAddress, long amountSats, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.SparkTransfer!>!
 static NSpark.Services.WithdrawalService.GetFeeQuoteAsync(this NSpark.SparkWallet! wallet, string![]! leafIds, string! onChainAddress, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.FeeQuote!>!
+static NSpark.Services.WithdrawalService.QuoteWithdrawAllAsync(this NSpark.SparkWallet! wallet, string! onChainAddress, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.WithdrawAllQuote!>!
+static NSpark.Services.WithdrawalService.WithdrawAllAsync(this NSpark.SparkWallet! wallet, string! onChainAddress, long? maxFeeSats = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.WithdrawAllResult!>!
 static NSpark.Services.WithdrawalService.WithdrawAsync(this NSpark.SparkWallet! wallet, string! onChainAddress, long amountSats, long? maxFeeSats = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
 static NSpark.Signer.AdaptorKeyHandle.operator !=(NSpark.Signer.AdaptorKeyHandle? left, NSpark.Signer.AdaptorKeyHandle? right) -> bool
 static NSpark.Signer.AdaptorKeyHandle.operator ==(NSpark.Signer.AdaptorKeyHandle? left, NSpark.Signer.AdaptorKeyHandle? right) -> bool
+static NSpark.Signer.Bip39.IsValid(string? mnemonic) -> bool
+static NSpark.Signer.Bip39.Validate(string? mnemonic) -> void
 static NSpark.Signer.ClaimTweakLeafDescriptor.operator !=(NSpark.Signer.ClaimTweakLeafDescriptor? left, NSpark.Signer.ClaimTweakLeafDescriptor? right) -> bool
 static NSpark.Signer.ClaimTweakLeafDescriptor.operator ==(NSpark.Signer.ClaimTweakLeafDescriptor? left, NSpark.Signer.ClaimTweakLeafDescriptor? right) -> bool
 static NSpark.Signer.EncryptedClaimTweakBatch.operator !=(NSpark.Signer.EncryptedClaimTweakBatch? left, NSpark.Signer.EncryptedClaimTweakBatch? right) -> bool
@@ -945,7 +1093,7 @@ static NSpark.Signer.EncryptedPreimageShareBundle.operator ==(NSpark.Signer.Encr
 static NSpark.Signer.EncryptedSendTweakBatch.operator !=(NSpark.Signer.EncryptedSendTweakBatch? left, NSpark.Signer.EncryptedSendTweakBatch? right) -> bool
 static NSpark.Signer.EncryptedSendTweakBatch.operator ==(NSpark.Signer.EncryptedSendTweakBatch? left, NSpark.Signer.EncryptedSendTweakBatch? right) -> bool
 static NSpark.Signer.FrostAggregator.Aggregate(byte[]! message, System.Collections.Generic.IReadOnlyDictionary<string!, NSpark.Signer.SigningCommitment!>! statechainCommitments, NSpark.Signer.SigningCommitment! selfCommitment, System.Collections.Generic.IReadOnlyDictionary<string!, byte[]!>! statechainSignatures, byte[]! selfSignature, System.Collections.Generic.IReadOnlyDictionary<string!, byte[]!>! statechainPublicKeys, byte[]! selfPublicKey, byte[]! verifyingKey, byte[]? adaptorPublicKey = null) -> byte[]!
-static NSpark.Signer.KeyDerivation.FromMnemonic(string! mnemonic, int account = 0, string? passphrase = null) -> NSpark.Signer.KeyDerivation!
+static NSpark.Signer.KeyDerivation.FromMnemonic(string! mnemonic, int account = 0, string? passphrase = null, bool validateMnemonic = true) -> NSpark.Signer.KeyDerivation!
 static NSpark.Signer.KeyDerivation.FromSeed(byte[]! seed, int account = 0) -> NSpark.Signer.KeyDerivation!
 static NSpark.Signer.LeafFrostNonceCommitment.operator !=(NSpark.Signer.LeafFrostNonceCommitment? left, NSpark.Signer.LeafFrostNonceCommitment? right) -> bool
 static NSpark.Signer.LeafFrostNonceCommitment.operator ==(NSpark.Signer.LeafFrostNonceCommitment? left, NSpark.Signer.LeafFrostNonceCommitment? right) -> bool
@@ -957,7 +1105,7 @@ static NSpark.Signer.SigningCommitment.operator !=(NSpark.Signer.SigningCommitme
 static NSpark.Signer.SigningCommitment.operator ==(NSpark.Signer.SigningCommitment? left, NSpark.Signer.SigningCommitment? right) -> bool
 static NSpark.Signer.SoTarget.operator !=(NSpark.Signer.SoTarget? left, NSpark.Signer.SoTarget? right) -> bool
 static NSpark.Signer.SoTarget.operator ==(NSpark.Signer.SoTarget? left, NSpark.Signer.SoTarget? right) -> bool
-static NSpark.Signer.SparkSigner.FromMnemonic(string! mnemonic, int account = 0, string? passphrase = null) -> NSpark.Signer.SparkSigner!
+static NSpark.Signer.SparkSigner.FromMnemonic(string! mnemonic, int account = 0, string? passphrase = null, bool validateMnemonic = true) -> NSpark.Signer.SparkSigner!
 static NSpark.SigningOperatorConfig.operator !=(NSpark.SigningOperatorConfig? left, NSpark.SigningOperatorConfig? right) -> bool
 static NSpark.SigningOperatorConfig.operator ==(NSpark.SigningOperatorConfig? left, NSpark.SigningOperatorConfig? right) -> bool
 static NSpark.SparkOptions.DefaultSigningThreshold(int operatorCount) -> uint
