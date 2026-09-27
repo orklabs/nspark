@@ -10,16 +10,20 @@ will be reflected here.
 
 ## [Unreleased]
 
+## [0.3.0-alpha.1] - 2026-09-27
+
 Brings NSpark to the level of the Swift SDK 0.3.0 (`spark-swift-sdk`, 2026-09-27): parity
 with the reference TypeScript SDK (`buildonspark/spark` at `0b3a32a`) for V3 token
 transactions, verified deposit addresses, safer claims and Lightning sends, a self-healing
 event stream, working static-deposit refunds, and the reference transport. Also carries the
 Swift 0.2.0 items NSpark had not received: operator-list reconciliation, BIP-39 validation,
 bounds-checked transaction parsing, network-checked Spark addresses, and `WithdrawAllAsync`.
-Every flow was re-run on mainnet with the integration wallets (Spark transfers and claims,
-swaps, Lightning sends including the resume path, the event stream, V3 and V2 tokens, the
-coop-exit dry run, renewal and consolidation); 485 unit tests run against an in-process
-operator stand-in on net8.0, net9.0 and net10.0.
+Every flow was re-run on mainnet with the integration wallets: Spark transfers and claims,
+swaps, Lightning receives and sends (the resume path, and a payment to an external Lightning
+address), the event stream, V3 and V2 tokens, renewal and consolidation, and an on-chain round
+trip — a cooperative exit to a static deposit address, the deposit's refund, and its claim back
+into Spark. 485 unit tests run against an in-process operator stand-in on net8.0, net9.0 and
+net10.0, on Linux, macOS and Windows.
 
 ### Security
 - **Deposit addresses are verified before they are returned**, as the reference SDK does.
@@ -717,7 +721,16 @@ the wallet plugs into the gRPC request.
 - See [docs/trust-model.md](docs/trust-model.md) for the documented threat
   model and the default Signing Operator / SSP trust assumptions.
 
-[Unreleased]: https://github.com/p-i-g-g-y/nspark/compare/v0.2.0-alpha.3...HEAD
-[0.2.0-alpha.3]: https://github.com/p-i-g-g-y/nspark/releases/tag/v0.2.0-alpha.3
-[0.1.0-alpha.2]: https://github.com/p-i-g-g-y/nspark/releases/tag/v0.1.0-alpha.2
-[0.1.0-alpha.1]: https://github.com/p-i-g-g-y/nspark/releases/tag/v0.1.0-alpha.1
+[Unreleased]: https://github.com/orklabs/nspark/compare/v0.3.0-alpha.1...HEAD
+[0.3.0-alpha.1]: https://github.com/orklabs/nspark/releases/tag/v0.3.0-alpha.1
+[0.2.0-alpha.4]: https://github.com/orklabs/nspark/releases/tag/v0.2.0-alpha.4
+[0.2.0-alpha.3]: https://github.com/orklabs/nspark/releases/tag/v0.2.0-alpha.3
+[0.2.0-alpha.2]: https://github.com/orklabs/nspark/releases/tag/v0.2.0-alpha.2
+[0.2.0-alpha.1]: https://github.com/orklabs/nspark/releases/tag/v0.2.0-alpha.1
+[0.1.0-alpha.7]: https://github.com/orklabs/nspark/releases/tag/v0.1.0-alpha.7
+[0.1.0-alpha.6]: https://github.com/orklabs/nspark/releases/tag/v0.1.0-alpha.6
+[0.1.0-alpha.5]: https://github.com/orklabs/nspark/releases/tag/v0.1.0-alpha.5
+[0.1.0-alpha.4]: https://github.com/orklabs/nspark/releases/tag/v0.1.0-alpha.4
+[0.1.0-alpha.3]: https://github.com/orklabs/nspark/releases/tag/v0.1.0-alpha.3
+[0.1.0-alpha.2]: https://github.com/orklabs/nspark/releases/tag/v0.1.0-alpha.2
+[0.1.0-alpha.1]: https://github.com/orklabs/nspark/releases/tag/v0.1.0-alpha.1
