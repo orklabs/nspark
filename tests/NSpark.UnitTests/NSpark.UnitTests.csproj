@@ -27,4 +27,30 @@
     <Using Include="FluentAssertions" />
   </ItemGroup>
 
+  <!-- The operators' cross-language hash vectors (buildonspark/spark spark/testdata @ 0b3a32a, unchanged). -->
+  <ItemGroup>
+    <None Include="Vectors\*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Copy the spark_frost native library to the output root so P/Invoke finds it during tests:
+       a project reference does not list runtimes/{rid}/native assets in the deps file. -->
+  <PropertyGroup>
+    <SparkFrostArch>$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</SparkFrostArch>
+    <SparkFrostRuntimes>..\..\src\NSpark\runtimes</SparkFrostRuntimes>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="$(SparkFrostRuntimes)\osx-$(SparkFrostArch)\native\libspark_frost.dylib"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="libspark_frost.dylib"
+          Condition="$([MSBuild]::IsOSPlatform('osx')) and Exists('$(SparkFrostRuntimes)\osx-$(SparkFrostArch)\native\libspark_frost.dylib')" />
+    <None Include="$(SparkFrostRuntimes)\linux-$(SparkFrostArch)\native\libspark_frost.so"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="libspark_frost.so"
+          Condition="$([MSBuild]::IsOSPlatform('linux')) and Exists('$(SparkFrostRuntimes)\linux-$(SparkFrostArch)\native\libspark_frost.so')" />
+    <None Include="$(SparkFrostRuntimes)\win-$(SparkFrostArch)\native\spark_frost.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="spark_frost.dll"
+          Condition="$([MSBuild]::IsOSPlatform('windows')) and Exists('$(SparkFrostRuntimes)\win-$(SparkFrostArch)\native\spark_frost.dll')" />
+  </ItemGroup>
+
 </Project>

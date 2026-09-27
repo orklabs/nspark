@@ -147,23 +147,75 @@ public sealed class TransferLeafVerifierTests
     }
 
     [Test]
-    public void Rejects_a_transfer_addressed_to_someone_else_but_tolerates_an_unset_receiver()
+    public void Rejects_a_transfer_that_does_not_name_this_wallet_as_its_receiver_or_one_of_its_receivers()
     {
         var transfer = MakeTransfer(Leaf(LegacySignature(compact: true)));
         var elsewhere = () => TransferLeafVerifier.Verify(transfer, new Key().PubKey.ToBytes());
-
         elsewhere.Should().Throw<SparkUntrustedResponseException>().WithMessage("*not addressed*");
 
         transfer.ReceiverIdentityPublicKey = ByteString.Empty;
         var unset = () => TransferLeafVerifier.Verify(transfer, Receiver);
+        unset.Should().Throw<SparkUntrustedResponseException>().WithMessage("*not addressed*");
 
-        unset.Should().NotThrow("multi-receiver transfers leave the top-level receiver empty");
+        // The operators record only the lowest receiver key of a multi-receiver transfer.
+        transfer.ReceiverIdentityPublicKey = ByteString.CopyFrom(new Key().PubKey.ToBytes());
+        transfer.Receivers.Add(new TransferReceiver { Id = "edge-me", IdentityPublicKey = ByteString.CopyFrom(Receiver) });
+        var listed = () => TransferLeafVerifier.Verify(transfer, Receiver);
+        listed.Should().NotThrow();
+    }
+
+    [Test]
+    public void A_multi_receiver_transfer_is_claimed_for_this_wallets_own_leaves_whichever_receiver_the_operators_recorded()
+    {
+        byte[] other = [0x03, .. Enumerable.Repeat((byte)0x44, 32)];
+        static TransferReceiver Edge(string id, byte[] key, TransferReceiverStatus status = TransferReceiverStatus.KeyTweaked) =>
+            new() { Id = id, IdentityPublicKey = ByteString.CopyFrom(key), Status = status };
+        var mine = Leaf(LegacySignature(compact: true));
+        mine.TransferReceiverId = "edge-me";
+        var theirs = new TransferLeaf { Leaf = new TreeNode { Id = "leaf-2" }, SecretCipher = ByteString.CopyFrom(Cipher), TransferReceiverId = "edge-other" };
+        var split = MakeTransfer(mine);
+        split.Leaves.Add(theirs);
+        split.ReceiverIdentityPublicKey = ByteString.CopyFrom(other);
+        split.Receivers.Add(Edge("edge-other", other));
+        split.Receivers.Add(Edge("edge-me", Receiver));
+
+        var scoped = TransferLeafVerifier.Scoped(split, Receiver);
+        scoped.Leaves.Select(l => l.Leaf.Id).Should().Equal(LeafId);
+        var verify = () => TransferLeafVerifier.Verify(scoped, Receiver);
+        verify.Should().NotThrow("the other receiver's leaf is not this wallet's to verify");
+
+        // Not among the receivers, or no leaves on this wallet's edge.
+        var stranger = () => TransferLeafVerifier.Scoped(split, SenderPubKey);
+        stranger.Should().Throw<SparkUntrustedResponseException>();
+        var unassigned = split.Clone();
+        unassigned.Leaves.Remove(unassigned.Leaves.First(l => l.TransferReceiverId == "edge-me"));
+        var nothing = () => TransferLeafVerifier.Scoped(unassigned, Receiver);
+        nothing.Should().Throw<SparkUntrustedResponseException>();
+        // A single-receiver transfer is not narrowed.
+        var single = MakeTransfer(Leaf(LegacySignature(compact: true)));
+        TransferLeafVerifier.Scoped(single, Receiver).Should().BeSameAs(single);
+
+        // This wallet's leg completes with its own edge, before the whole transfer does.
+        TransferLeafVerifier.IsReceiverLegComplete(split, Receiver).Should().BeFalse();
+        var legDone = split.Clone();
+        legDone.Receivers[1].Status = TransferReceiverStatus.Completed;
+        TransferLeafVerifier.IsReceiverLegComplete(legDone, Receiver).Should().BeTrue();
+        TransferLeafVerifier.IsReceiverLegComplete(legDone, other).Should().BeFalse();
+        var whole = single.Clone();
+        whole.Status = TransferStatus.Completed;
+        TransferLeafVerifier.IsReceiverLegComplete(whole, Receiver).Should().BeTrue();
+        TransferLeafVerifier.IsReceiverLegComplete(single, Receiver).Should().BeFalse();
     }
 
     [Test]
     public void Rejects_transfers_without_leaves_node_data_or_cipher()
     {
-        var empty = new Transfer { Id = TransferId, SenderIdentityPublicKey = ByteString.CopyFrom(SenderPubKey) };
+        var empty = new Transfer
+        {
+            Id = TransferId,
+            SenderIdentityPublicKey = ByteString.CopyFrom(SenderPubKey),
+            ReceiverIdentityPublicKey = ByteString.CopyFrom(Receiver),
+        };
         var noNode = MakeTransfer(new TransferLeaf { SecretCipher = ByteString.CopyFrom(Cipher) });
         var noCipherLeaf = Leaf(LegacySignature(compact: true));
         noCipherLeaf.SecretCipher = ByteString.Empty;

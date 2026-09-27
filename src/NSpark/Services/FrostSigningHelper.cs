@@ -154,22 +154,131 @@ internal static class FrostSigningHelper
         => network == SparkNetwork.Mainnet ? "mainnet" : "regtest";
 
     /// <summary>
-    /// Build the list of <see cref="SoTarget"/>s the signer needs to address its encrypted
-    /// share bundles. Cross-references the live SO list from gRPC (for the 1-based share
-    /// index) with the static SO config (for each operator's identity public key).
+    /// Build the list of <see cref="SoTarget"/>s the signer needs to address its encrypted share
+    /// bundles, by reconciling the coordinator's operator list with the wallet configuration.
+    /// Every listed operator must be configured, the two lists must be the same size, and the
+    /// indices must be a permutation of <c>0..n-1</c>. Secret shares are only ever encrypted to the
+    /// configured operators' identity keys — never to keys the coordinator reports.
     /// </summary>
+    /// <exception cref="Exceptions.SparkUntrustedResponseException">The coordinator's list does not match the configuration.</exception>
+    /// <exception cref="Exceptions.SparkConfigurationException">A configured operator has no valid identity key.</exception>
     internal static IReadOnlyList<SoTarget> BuildSoTargets(
         Google.Protobuf.Collections.MapField<string, NSpark.Proto.SigningOperatorInfo> soOperators,
         NSpark.SigningOperatorConfig[] soConfigs)
     {
+        const string operation = "operators.reconcile";
+        if (soOperators.Count == 0)
+        {
+            throw new Exceptions.SparkUntrustedResponseException(
+                operation, "The coordinator returned an empty signing operator list.");
+        }
+        if (soOperators.Count != soConfigs.Length)
+        {
+            throw new Exceptions.SparkUntrustedResponseException(
+                operation,
+                $"The coordinator lists {soOperators.Count} signing operators; the wallet is configured for {soConfigs.Length}.");
+        }
+
         var targets = new List<SoTarget>(soOperators.Count);
+        var seenIndices = new HashSet<ulong>();
         foreach (var (soId, soInfo) in soOperators)
         {
-            var soConfig = soConfigs.First(c => c.Identifier == soId);
-            var pubKey = Convert.FromHexString(soConfig.IdentityPublicKeyHex);
-            targets.Add(new SoTarget(soId, (uint)(soInfo.Index + 1), pubKey));
+            var soConfig = soConfigs.FirstOrDefault(c => string.Equals(c.Identifier, soId, StringComparison.Ordinal))
+                ?? throw new Exceptions.SparkUntrustedResponseException(
+                    operation, $"The coordinator listed operator {soId}, which is not in the wallet configuration.");
+            if (soInfo.Index >= (ulong)soConfigs.Length || !seenIndices.Add(soInfo.Index))
+            {
+                throw new Exceptions.SparkUntrustedResponseException(
+                    operation, $"The coordinator reported an invalid or duplicate index {soInfo.Index} for operator {soId}.");
+            }
+
+            targets.Add(new SoTarget(soId, (uint)soInfo.Index + 1, ConfiguredIdentityKey(soConfig)));
         }
+
+        return targets.OrderBy(t => t.ShareIndex).ToList();
+    }
+
+    /// <summary>
+    /// Targets for a Lightning receive's preimage shares, from the configuration alone: each
+    /// operator validates the share at its own index — its identifier, a 32-byte big-endian
+    /// number equal to its index + 1 — whatever the order of the configuration (the reference
+    /// SDK's <c>shares[operator.id]</c>).
+    /// </summary>
+    /// <exception cref="Exceptions.SparkConfigurationException">An identifier or identity key is not valid.</exception>
+    internal static IReadOnlyList<SoTarget> BuildConfiguredSoTargets(NSpark.SigningOperatorConfig[] soConfigs)
+    {
+        var targets = new List<SoTarget>(soConfigs.Length);
+        var seen = new HashSet<uint>();
+        foreach (var soConfig in soConfigs)
+        {
+            var index = OperatorShareIndex(soConfig.Identifier)
+                ?? throw new Exceptions.SparkConfigurationException(
+                    "operators.config", $"Operator identifier {soConfig.Identifier} is not a 32-byte index.");
+            if (index > (uint)soConfigs.Length || !seen.Add(index))
+            {
+                throw new Exceptions.SparkConfigurationException(
+                    "operators.config", $"Operator identifier {soConfig.Identifier} is out of range or duplicated.");
+            }
+
+            targets.Add(new SoTarget(soConfig.Identifier, index, ConfiguredIdentityKey(soConfig)));
+        }
+
         return targets;
+    }
+
+    /// <summary>
+    /// The secret-share index an operator validates its share at: its identifier, a 32-byte
+    /// big-endian number equal to its index + 1. <c>null</c> when it is not one.
+    /// </summary>
+    internal static uint? OperatorShareIndex(string identifier)
+    {
+        if (identifier is not { Length: 64 } || !identifier.All(Uri.IsHexDigit))
+        {
+            return null;
+        }
+
+        // Every byte above the last four must be zero.
+        if (identifier[..56].Any(c => c != '0'))
+        {
+            return null;
+        }
+
+        var index = uint.Parse(identifier[56..], System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture);
+        return index > 0 ? index : null;
+    }
+
+    /// <summary>
+    /// A FROST threshold must be at least 1 and at most the number of operators.
+    /// </summary>
+    /// <exception cref="Exceptions.SparkConfigurationException">The threshold is out of range.</exception>
+    internal static void ValidateThreshold(uint threshold, int operatorCount)
+    {
+        if (threshold < 1 || threshold > (uint)operatorCount)
+        {
+            throw new Exceptions.SparkConfigurationException(
+                "operators.threshold", $"Signing threshold {threshold} is not valid for {operatorCount} operators.");
+        }
+    }
+
+    private static byte[] ConfiguredIdentityKey(NSpark.SigningOperatorConfig soConfig)
+    {
+        byte[]? key = null;
+        try
+        {
+            key = Convert.FromHexString(soConfig.IdentityPublicKeyHex ?? string.Empty);
+        }
+        catch (FormatException)
+        {
+            key = null;
+        }
+
+        if (key is not { Length: 33 })
+        {
+            throw new Exceptions.SparkConfigurationException(
+                "operators.config", $"Operator {soConfig.Identifier} has no valid identity public key configured.");
+        }
+
+        return key;
     }
 
     // ─────────────────────────────────────────────────────────────────────────

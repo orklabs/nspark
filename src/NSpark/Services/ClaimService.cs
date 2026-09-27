@@ -1,4 +1,5 @@
 using Google.Protobuf;
+using Grpc.Core;
 using NSpark.Models;
 using NSpark.Proto;
 
@@ -7,181 +8,223 @@ namespace NSpark.Services;
 /// <inheritdoc/>
 public static class ClaimService
 {
-    private const uint TimeLockInterval = 100;
-    private const uint DirectTimelockOffset = 50;
+    private const string Operation = "transfer.claim";
 
     /// <summary>
-    /// Claim all pending incoming transfers (Spark transfers and Lightning receives).
-    /// Without calling this, incoming funds remain in "pending" state and never appear in the wallet balance.
-    /// Transfers that fail to claim are skipped; successfully claimed transfers are returned.
+    /// Claim every pending inbound transfer (Spark transfers, Lightning receives, deposits the SSP
+    /// credited) and report what could not be claimed. Without claiming, incoming funds stay
+    /// pending and never appear in the wallet balance.
     /// </summary>
-    public static async Task<IReadOnlyList<SparkTransfer>> ClaimPendingTransfersAsync(
+    /// <remarks>
+    /// <para>
+    /// Claims run one at a time, wallet-wide: a swap's claim of its counter-transfer or a
+    /// concurrent pass waits for this one. A transfer that cannot be claimed — for example one
+    /// whose sender signature does not verify — is recorded in
+    /// <see cref="PendingTransferClaim.Failures"/> and the pass moves on to the rest, as the
+    /// reference SDK does; it is tried again on the next pass. A transfer the operators already
+    /// recorded as claimed by this wallet counts as claimed.
+    /// </para>
+    /// <para>
+    /// Claimed leaves whose refund timelock is in the renewal range (100…199 — a transfer from a
+    /// leaf at 200 arrives at 100) are renewed right away, best effort, as the reference SDK does
+    /// when it registers claimed leaves; spend paths renew anything that is left.
+    /// </para>
+    /// </remarks>
+    public static async Task<PendingTransferClaim> ClaimPendingTransfersAsync(
         this SparkWallet wallet,
         CancellationToken ct = default)
     {
-        var coordinatorAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
-        var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
-        var networkStr = FrostSigningHelper.GetNetworkString(wallet.Client.Options.Network);
+        ArgumentNullException.ThrowIfNull(wallet);
+        var result = await wallet.ClaimPendingTransfersCoreAsync(ct).ConfigureAwait(false);
+        return new PendingTransferClaim(
+            result.Claimed.Select(TransferMapping.ToModel).ToList(),
+            result.Failures);
+    }
 
-        // Step 1: Query pending transfers where we are the receiver
-        var protoNetwork = wallet.Client.Options.Network == SparkNetwork.Mainnet
-            ? Network.Mainnet : Network.Regtest;
+    /// <summary>One claim pass, returning the claimed transfers as the operators reported them.</summary>
+    internal static async Task<PendingTransferDrain.Result> ClaimPendingTransfersCoreAsync(
+        this SparkWallet wallet,
+        CancellationToken ct)
+    {
+        PendingTransferDrain.Result result;
+        await wallet.ClaimLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            result = await PendingTransferDrain.RunAsync(
+                (limit, offset, innerCt) => wallet.QueryPendingTransfersAsync(limit, offset, innerCt),
+                (transfer, innerCt) => ClaimTreatingDuplicatesAsClaimedAsync(wallet, transfer, innerCt),
+                ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            wallet.ClaimLock.Release();
+        }
+
+        await wallet.RenewClaimedLeavesAsync(result.ClaimedLeafIds, ct).ConfigureAwait(false);
+        return result;
+    }
+
+    /// <summary>
+    /// Pending transfers where this wallet is the receiver, one page. <paramref name="limit"/> 0
+    /// asks for the server's largest page (100).
+    /// </summary>
+    internal static async Task<IReadOnlyList<Transfer>> QueryPendingTransfersAsync(
+        this SparkWallet wallet,
+        int limit,
+        int offset,
+        CancellationToken ct)
+    {
+        var client = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
         var filter = new TransferFilter
         {
             ReceiverIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
-            Network = protoNetwork,
+            Network = wallet.Options.ProtoNetwork(),
+            Limit = limit,
+            Offset = offset,
         };
-        var pendingResponse = await coordinatorClient.query_pending_transfersAsync(
-            filter, headers, cancellationToken: ct);
+        var response = await client.query_pending_transfersAsync(filter, headers, cancellationToken: ct).ConfigureAwait(false);
+        return response.Transfers;
+    }
 
-        var claimed = new List<SparkTransfer>();
-        if (pendingResponse.Transfers.Count == 0)
+    /// <summary>
+    /// Claim one transfer under the wallet-wide claim lock (used by swaps for their
+    /// counter-transfer, which a concurrent claim pass may already have claimed).
+    /// </summary>
+    internal static async Task ClaimTransferAsync(SparkWallet wallet, Transfer transfer, CancellationToken ct)
+    {
+        await wallet.ClaimLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            return claimed;
+            await ClaimTreatingDuplicatesAsClaimedAsync(wallet, transfer, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            wallet.ClaimLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Best-effort renewal of the renewable leaves among <paramref name="leafIds"/>.
+    /// </summary>
+    internal static async Task RenewClaimedLeavesAsync(
+        this SparkWallet wallet,
+        IReadOnlyCollection<string> leafIds,
+        CancellationToken ct)
+    {
+        if (leafIds.Count == 0)
+        {
+            return;
         }
 
-        // Step 2: Get SO operator info
-        var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
-            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct);
-        var soOperators = soListResponse.SigningOperators;
-
-        // Process each pending transfer
-        foreach (var transfer in pendingResponse.Transfers)
+        try
         {
-            var transferLeaves = transfer.Leaves.ToList();
-            if (transferLeaves.Count == 0)
+            var ids = leafIds.ToHashSet(StringComparer.Ordinal);
+            var leaves = (await wallet.GetLeavesAsync(ct).ConfigureAwait(false)).Where(l => ids.Contains(l.Id)).ToList();
+            if (RenewalService.RenewalCandidates(leaves).Renewable.Count > 0)
             {
-                continue;
+                _ = await wallet.RenewLeavesAsync(leaves, ct).ConfigureAwait(false);
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Best effort: spend paths renew anything left.
+        }
+    }
 
-            try
-            {
-                var result = await ClaimSingleTransferAsync(
-                    wallet, coordinatorClient, headers, networkStr,
-                    soOperators, transfer, transferLeaves, ct).ConfigureAwait(false);
-                claimed.Add(result);
-            }
-            catch (OperationCanceledException)
+    /// <summary>
+    /// The operators answer ALREADY_EXISTS once this receiver has claimed the transfer; like the
+    /// reference SDK, confirm this wallet's leg is complete and treat it as claimed.
+    /// </summary>
+    private static async Task ClaimTreatingDuplicatesAsClaimedAsync(SparkWallet wallet, Transfer transfer, CancellationToken ct)
+    {
+        try
+        {
+            await ClaimTransferNowAsync(wallet, transfer, ct).ConfigureAwait(false);
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.AlreadyExists)
+        {
+            var current = await wallet.QueryTransferByIdAsync(transfer.Id, ct).ConfigureAwait(false);
+            if (!TransferLeafVerifier.IsReceiverLegComplete(current, wallet.IdentityPublicKey))
             {
                 throw;
             }
-            catch
-            {
-                // Skip transfers that fail (a transfer that fails sender-signature verification,
-                // or corrupted state from previous attempts); the rest are still claimed.
-            }
         }
-
-        return claimed;
     }
 
-    internal static async Task<SparkTransfer> ClaimSingleTransferAsync(
-        SparkWallet wallet,
-        SparkService.SparkServiceClient coordinatorClient,
-        Grpc.Core.Metadata headers,
-        string networkStr,
-        Google.Protobuf.Collections.MapField<string, SigningOperatorInfo> soOperators,
-        Transfer transfer,
-        List<TransferLeaf> transferLeaves,
-        CancellationToken ct)
+    /// <summary>
+    /// Claim a single pending transfer with <c>claim_transfer</c> and a claim package. A
+    /// multi-receiver transfer is narrowed to this wallet's own leaves, and the sender's signature
+    /// on every leaf is verified first; a transfer that fails verification is refused before any
+    /// secret is decrypted or any refund is signed. Callers hold the claim lock.
+    /// </summary>
+    private static async Task ClaimTransferNowAsync(SparkWallet wallet, Transfer pending, CancellationToken ct)
     {
-        // The sender's signature on every leaf is verified first; a transfer that fails
-        // verification is refused before any secret is decrypted or any refund is signed.
+        var transfer = TransferLeafVerifier.Scoped(pending, wallet.IdentityPublicKey);
         TransferLeafVerifier.Verify(transfer, wallet.IdentityPublicKey);
 
-        // Step 3: Get signing commitments (Count=3: cpfp, direct, directFromCpfp)
-        var commitmentsRequest = new GetSigningCommitmentsRequest
-        {
-            Count = 3,
-            NodeIdCount = (uint)transferLeaves.Count,
-        };
-        var commitmentsResponse = await coordinatorClient.get_signing_commitmentsAsync(
-            commitmentsRequest, headers, cancellationToken: ct);
-        var allCommitments = commitmentsResponse.SigningCommitments.ToList();
+        var options = wallet.Options;
+        var coordinatorClient = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+        var networkStr = FrostSigningHelper.GetNetworkString(options.Network);
+        var transferLeaves = transfer.Leaves;
 
-        // Step 4: Build encrypted per-SO claim-tweak packages via the signer in one call.
-        // The signer ECIES-decrypts each leaf's senderSecretCipher, derives the receiver's
-        // new per-leaf key, VSS-splits the tweak, and ECIES-encrypts each SO's package —
-        // no plaintext share material crosses the wallet boundary.
-        var threshold = wallet.Client.Options.EffectiveSigningThreshold;
-        var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, wallet.Client.Options.SigningOperators);
+        var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
+            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct).ConfigureAwait(false);
+        var soTargets = FrostSigningHelper.BuildSoTargets(soListResponse.SigningOperators, options.SigningOperators);
+        var threshold = options.EffectiveSigningThreshold;
+        FrostSigningHelper.ValidateThreshold(threshold, soTargets.Count);
+
+        // Signing commitments (Count=3: cpfp, direct, directFromCpfp), leaf-major.
+        var commitmentsResponse = await coordinatorClient.get_signing_commitmentsAsync(
+            new GetSigningCommitmentsRequest { Count = 3, NodeIdCount = (uint)transferLeaves.Count },
+            headers,
+            cancellationToken: ct).ConfigureAwait(false);
+        var allCommitments = commitmentsResponse.SigningCommitments;
+        if (allCommitments.Count < 3 * transferLeaves.Count)
+        {
+            throw new Exceptions.SparkUntrustedResponseException(
+                Operation, $"Got {allCommitments.Count} signing commitments, need {3 * transferLeaves.Count}.");
+        }
+
+        // Encrypted per-SO claim-tweak packages from the signer, which ECIES-decrypts each leaf's
+        // secret cipher, derives the receiver's new per-leaf key, VSS-splits the tweak and
+        // encrypts each SO's package — no plaintext share material crosses the wallet boundary.
         var claimDescriptors = transferLeaves
-            .Select(tl => new NSpark.Signer.ClaimTweakLeafDescriptor(
-                tl.Leaf.Id,
-                tl.SecretCipher.ToByteArray()))
+            .Select(tl => new Signer.ClaimTweakLeafDescriptor(tl.Leaf.Id, tl.SecretCipher.ToByteArray()))
             .ToList();
         var encryptedClaim = await wallet.Signer.BuildEncryptedClaimTweaksAsync(
             claimDescriptors, soTargets, threshold, ct).ConfigureAwait(false);
 
-        // Step 5: FROST sign refund trios for each leaf using the new per-leaf public key
-        // returned by the signer.
+        // FROST-sign each leaf's refunds to the new per-leaf public key the signer returned.
         var cpfpRefundJobs = new List<UserSignedTxSigningJob>();
         var directRefundJobs = new List<UserSignedTxSigningJob>();
         var directFromCpfpRefundJobs = new List<UserSignedTxSigningJob>();
 
-        for (int i = 0; i < transferLeaves.Count; i++)
+        for (var i = 0; i < transferLeaves.Count; i++)
         {
             var transferLeaf = transferLeaves[i];
             var node = transferLeaf.Leaf;
             var verifyingKey = node.VerifyingPublicKey.ToByteArray();
             var newSigningPubKey = encryptedClaim.NewPublicKeyByLeafId[node.Id];
 
-            // Extract the refund sequence from the sender's intermediate refund tx
-            var intermediateRefundBytes = transferLeaf.IntermediateRefundTx.ToByteArray();
-            var nodeRefundBytes = node.RefundTx.ToByteArray();
-            uint currentSequence;
-            if (intermediateRefundBytes.Length > 0)
-            {
-                currentSequence = ParseInputSequence(intermediateRefundBytes);
-            }
-            else if (nodeRefundBytes.Length > 0)
-            {
-                currentSequence = ParseInputSequence(nodeRefundBytes);
-            }
-            else
-            {
-                currentSequence = ParseInputSequence(node.NodeTx.ToByteArray());
-            }
-
-            // Round DOWN to nearest TimeLockInterval for claim sequence
-            var currentTimelock = currentSequence & 0xFFFF;
-            var bit30 = currentSequence & (1u << 30);
-            var remainder = currentTimelock % TimeLockInterval;
-            if (remainder != 0)
-            {
-                currentTimelock -= remainder;
-            }
-
-            var claimSeq = bit30 | currentTimelock;
-            var claimDirectSeq = bit30 | (currentTimelock + DirectTimelockOffset);
-
-            // Construct refund tx trio (cpfp, direct, directFromCpfp)
-            var cpfpNodeTx = node.NodeTx.ToByteArray();
-            var directNodeTx = node.DirectTx.Length > 0 ? node.DirectTx.ToByteArray() : null;
-
-            var refundTrio = SparkTxBuilder.BuildRefundTxTrio(
-                cpfpNodeTx: cpfpNodeTx,
-                directNodeTx: directNodeTx,
-                vout: 0,
-                receivingPublicKey: newSigningPubKey,
-                network: networkStr,
-                sequence: claimSeq,
-                directSequence: claimDirectSeq,
-                feeSats: SparkConstants.DefaultRefundFeeSats);
+            var (claimSeq, claimDirectSeq) = ClaimSequences(transferLeaf);
+            var refundTrio = TimelockHelper.LeafRefundTrio(node, newSigningPubKey, networkStr, claimSeq, claimDirectSeq);
 
             // Commitments are interleaved: [leaf0_r0, leaf1_r0, ..., leaf0_r1, leaf1_r1, ...]
             var cpfpCommitments = allCommitments[i].SigningNonceCommitments;
             var directCommitments = allCommitments[i + transferLeaves.Count].SigningNonceCommitments;
-            var directFromCpfpCommitments = allCommitments[i + 2 * transferLeaves.Count].SigningNonceCommitments;
+            var directFromCpfpCommitments = allCommitments[i + (2 * transferLeaves.Count)].SigningNonceCommitments;
 
-            // FROST sign cpfp refund
             cpfpRefundJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
                 wallet.Signer, node.Id, verifyingKey,
                 refundTrio.CpfpRefund.Tx, refundTrio.CpfpRefund.Sighash, cpfpCommitments, ct)
                 .ConfigureAwait(false));
 
-            // FROST sign direct refund (if direct tx exists)
             if (refundTrio.DirectRefund != null)
             {
                 directRefundJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
@@ -190,7 +233,6 @@ public static class ClaimService
                     .ConfigureAwait(false));
             }
 
-            // FROST sign direct-from-cpfp refund
             directFromCpfpRefundJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
                 wallet.Signer, node.Id, verifyingKey,
                 refundTrio.DirectFromCpfpRefund.Tx, refundTrio.DirectFromCpfpRefund.Sighash,
@@ -204,42 +246,27 @@ public static class ClaimService
             keyTweakPackage[soId] = ByteString.CopyFrom(blob);
         }
 
-        // Step 6: Sign the key tweak package (BIP-340 tagged hash)
-        var transferIdBytes = Convert.FromHexString(transfer.Id.Replace("-", ""));
+        // Sign the key tweak package (BIP-340 tagged hash).
         var packageHash = SparkTaggedHash.Create("spark", "claim", "signing payload")
-            .AddBytes(transferIdBytes)
+            .AddBytes(TransferIdBytes(transfer.Id))
             .AddMapStringToBytes(keyTweakPackage)
             .Hash();
         var packageSignature = await wallet.Signer.SignWithIdentityKeyAsync(packageHash, ct).ConfigureAwait(false);
 
-        // Step 7: Build ClaimPackage
         var claimPackage = new ClaimPackage
         {
             UserSignature = ByteString.CopyFrom(packageSignature),
             HashVariant = HashVariant.V2,
         };
-        foreach (var job in cpfpRefundJobs)
-        {
-            claimPackage.LeavesToClaim.Add(job);
-        }
-
-        foreach (var job in directRefundJobs)
-        {
-            claimPackage.DirectLeavesToClaim.Add(job);
-        }
-
-        foreach (var job in directFromCpfpRefundJobs)
-        {
-            claimPackage.DirectFromCpfpLeavesToClaim.Add(job);
-        }
-
+        claimPackage.LeavesToClaim.AddRange(cpfpRefundJobs);
+        claimPackage.DirectLeavesToClaim.AddRange(directRefundJobs);
+        claimPackage.DirectFromCpfpLeavesToClaim.AddRange(directFromCpfpRefundJobs);
         foreach (var (soId, cipher) in keyTweakPackage)
         {
             claimPackage.KeyTweakPackage.Add(soId, cipher);
         }
 
-        // Step 8: Call claim_transfer
-        var claimResponse = await coordinatorClient.claim_transferAsync(
+        await coordinatorClient.claim_transferAsync(
             new ClaimTransferRequest
             {
                 TransferId = transfer.Id,
@@ -247,80 +274,138 @@ public static class ClaimService
                 ClaimPackage = claimPackage,
             },
             headers,
-            cancellationToken: ct);
-
-        var claimedTransfer = claimResponse.Transfer;
-        return new SparkTransfer(
-            Id: claimedTransfer.Id,
-            SenderIdentityPublicKey: Convert.ToHexString(claimedTransfer.SenderIdentityPublicKey.ToByteArray()),
-            ReceiverIdentityPublicKey: Convert.ToHexString(claimedTransfer.ReceiverIdentityPublicKey.ToByteArray()),
-            TotalValueSats: (long)claimedTransfer.TotalValue,
-            Status: claimedTransfer.Status.ToString(),
-            CreatedAt: claimedTransfer.CreatedTime.ToDateTimeOffset());
+            cancellationToken: ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Extract the nSequence from the leaf's refund transaction to determine the current timelock.
-    /// Falls back to the node_tx input sequence if refund_tx is empty.
+    /// A claim's refund sequences: the timelock of the sender's intermediate refund (else the
+    /// leaf's refund, else its node transaction) rounded down to the 100-block interval, and the
+    /// direct refunds 50 above — the reference SDK's claim with <c>enforceTimelocks</c>. Bit 30 is
+    /// kept.
     /// </summary>
-    internal static uint ExtractRefundSequence(TreeNode node)
+    internal static (uint Cpfp, uint Direct) ClaimSequences(TransferLeaf transferLeaf)
     {
-        var txBytes = node.RefundTx.Length > 0
-            ? node.RefundTx.ToByteArray()
-            : node.NodeTx.ToByteArray();
-        return ParseInputSequence(txBytes);
+        var node = transferLeaf.Leaf;
+        var source = !transferLeaf.IntermediateRefundTx.IsEmpty
+            ? transferLeaf.IntermediateRefundTx
+            : !node.RefundTx.IsEmpty ? node.RefundTx : node.NodeTx;
+        var rawSequence = TimelockHelper.ParseSequence(source.ToByteArray());
+        var timelock = TimelockHelper.RoundedTimelock(rawSequence & 0xFFFF);
+        var bit30 = rawSequence & (1u << 30);
+        return (bit30 | timelock, bit30 | ((timelock + TimelockHelper.DirectTimelockOffset) & 0xFFFF));
     }
 
     /// <summary>
-    /// Parse the raw nSequence from the first input in raw Bitcoin transaction bytes.
-    /// Returns the full 32-bit sequence value (including bit 30 for relative timelock type).
-    /// Callers extract lower 16 bits for timelock value and preserve upper bits as needed.
+    /// The raw nSequence of the first input of a raw Bitcoin transaction, bit 30 (the relative
+    /// timelock type) included. Bounds-checked: malformed bytes throw
+    /// <see cref="Exceptions.SparkUntrustedResponseException"/>.
     /// </summary>
-    internal static uint ParseInputSequence(byte[] txBytes)
-    {
-        int offset = 4; // skip version
+    internal static uint ParseInputSequence(byte[] txBytes) => TimelockHelper.ParseSequence(txBytes);
 
-        // Check for segwit marker (0x00 followed by 0x01)
-        if (txBytes[offset] == 0x00 && txBytes[offset + 1] == 0x01)
+    /// <summary>The 16 bytes of a transfer id (a UUID), as the signing payloads hash it.</summary>
+    internal static byte[] TransferIdBytes(string transferId)
+    {
+        byte[] bytes;
+        try
         {
-            offset += 2; // skip marker + flag
+            bytes = Convert.FromHexString(transferId.Replace("-", string.Empty, StringComparison.Ordinal));
+        }
+        catch (FormatException)
+        {
+            bytes = [];
         }
 
-        // Read input count (varint) — we only need the first input
-        offset += ReadVarIntSize(txBytes, offset);
-
-        // Skip prev_hash (32 bytes) + prev_index (4 bytes)
-        offset += 32 + 4;
-
-        // Read script length (varint) and skip script
-        var (scriptLen, varIntBytes) = ReadVarInt(txBytes, offset);
-        offset += varIntBytes + (int)scriptLen;
-
-        // Read raw nSequence (4 bytes LE) — preserve all bits including bit 30
-        return BitConverter.ToUInt32(txBytes, offset);
-    }
-
-    private static int ReadVarIntSize(byte[] data, int offset)
-    {
-        return data[offset] switch
+        if (bytes.Length != 16)
         {
-            < 0xFD => 1,
-            0xFD => 3,
-            0xFE => 5,
-            _ => 9,
-        };
-    }
+            throw new Exceptions.SparkConfigurationException(Operation, $"Transfer id '{transferId}' is not a UUID.");
+        }
 
-    private static (long value, int bytesRead) ReadVarInt(byte[] data, int offset)
+        return bytes;
+    }
+}
+
+/// <summary>
+/// One claim pass over the pending inbound transfers, following the reference SDK's
+/// <c>claimTransfers</c>: pages of 25, only transfers in a claimable status, a failure is
+/// recorded and the pass moves on, and after any progress it restarts from the head (claimed
+/// transfers leave the pending set, shifting later ones forward); otherwise it advances past the
+/// page. The pass is bounded to 100 pages, as the reference SDK's fallback is. A transfer that
+/// failed is not tried again within the same pass.
+/// </summary>
+internal static class PendingTransferDrain
+{
+    internal const int BatchSize = 25;
+    internal const int MaxBatches = 100;
+
+    /// <summary>Statuses the reference SDK claims; anything else is left for a later pass.</summary>
+    internal static readonly IReadOnlySet<TransferStatus> ClaimableStatuses = new HashSet<TransferStatus>
     {
-        var first = data[offset];
-        return first switch
-        {
-            < 0xFD => (first, 1),
-            0xFD => (BitConverter.ToUInt16(data, offset + 1), 3),
-            0xFE => (BitConverter.ToUInt32(data, offset + 1), 5),
-            _ => ((long)BitConverter.ToUInt64(data, offset + 1), 9),
-        };
+        TransferStatus.SenderKeyTweaked,
+        TransferStatus.ReceiverKeyTweaked,
+        TransferStatus.ReceiverRefundSigned,
+        TransferStatus.ReceiverKeyTweakApplied,
+        TransferStatus.ReceiverKeyTweakLocked,
+    };
+
+    /// <summary>The outcome of one pass.</summary>
+    internal sealed record Result(IReadOnlyList<Transfer> Claimed, IReadOnlyList<PendingTransferClaimFailure> Failures)
+    {
+        /// <summary>Leaves of the claimed transfers.</summary>
+        public IReadOnlyList<string> ClaimedLeafIds =>
+            Claimed.SelectMany(t => t.Leaves.Where(l => l.Leaf is not null).Select(l => l.Leaf.Id)).ToList();
     }
 
+    internal static async Task<Result> RunAsync(
+        Func<int, int, CancellationToken, Task<IReadOnlyList<Transfer>>> fetch,
+        Func<Transfer, CancellationToken, Task> claim,
+        CancellationToken ct)
+    {
+        var claimed = new List<Transfer>();
+        var failures = new List<PendingTransferClaimFailure>();
+        var attempted = new HashSet<string>(StringComparer.Ordinal);
+        var offset = 0;
+        for (var batchNumber = 0; batchNumber < MaxBatches; batchNumber++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var batch = await fetch(BatchSize, offset, ct).ConfigureAwait(false);
+            if (batch.Count == 0)
+            {
+                break;
+            }
+
+            var progress = false;
+            foreach (var transfer in batch)
+            {
+                if (!ClaimableStatuses.Contains(transfer.Status) || !attempted.Add(transfer.Id))
+                {
+                    continue;
+                }
+
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    await claim(transfer, ct).ConfigureAwait(false);
+                    claimed.Add(transfer);
+                    progress = true;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failures.Add(new PendingTransferClaimFailure(transfer.Id, ex));
+                }
+            }
+
+            if (batch.Count < BatchSize)
+            {
+                break;
+            }
+
+            offset = progress ? 0 : offset + batch.Count;
+        }
+
+        return new Result(claimed, failures);
+    }
 }

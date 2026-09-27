@@ -38,11 +38,7 @@ public static class ConsolidationService
         {
             _ = await wallet.RenewExhaustedLeavesAsync(ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Best-effort: the affected leaves surface in SkippedLeaves.
         }
@@ -76,6 +72,17 @@ public static class ConsolidationService
 
             _ = await wallet.ProcessSwapBatchAsync(batch, targets, ct).ConfigureAwait(false);
             rounds++;
+
+            // Swap outputs can arrive in the renewal range; renew them so the next round can use
+            // them (best effort, as before the first round).
+            try
+            {
+                _ = await wallet.RenewExhaustedLeavesAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Best effort: the affected leaves surface in SkippedLeaves.
+            }
 
             var refreshed = await wallet.GetLeavesAsync(ct).ConfigureAwait(false);
             if (refreshed.Count >= current.Count)

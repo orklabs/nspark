@@ -30,12 +30,10 @@ public sealed class OperatorKeysTests
     }
 
     [Test]
-    public async Task Regtest_wallet_skips_operators_with_empty_identity_pubkey()
+    public async Task Regtest_wallet_collects_the_hosted_operators_keys()
     {
-        // Regtest defaults have empty identity pubkey hex strings — they should be skipped.
-        // Note: setting Network alone doesn't auto-switch SigningOperators (each
-        // SparkOptions property defaults independently), so the test wires the
-        // regtest operators explicitly.
+        // The regtest preset is the hosted operators under their mainnet keys, as in the
+        // reference SDK's REGTEST preset.
         var options = Options.Create(new SparkOptions
         {
             Network = SparkNetwork.Regtest,
@@ -46,7 +44,21 @@ public sealed class OperatorKeysTests
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
 
         var keys = TokenService.CollectOperatorIdentityPublicKeys(wallet);
-        keys.Should().BeEmpty();
+        keys.Select(Hex).Should().BeEquivalentTo(
+            SparkOptions.GetDefaultOperators(SparkNetwork.Mainnet).Select(o => o.IdentityPublicKeyHex));
+    }
+
+    [Test]
+    public async Task Operators_without_an_identity_key_are_skipped()
+    {
+        var operators = SparkOptions.GetDefaultOperators(SparkNetwork.Regtest);
+        operators[1] = operators[1] with { IdentityPublicKeyHex = string.Empty };
+        var options = Options.Create(new SparkOptions { Network = SparkNetwork.Regtest, SigningOperators = operators });
+        using var connection = new SparkConnection(options, new HttpClient());
+        var wallet = await connection.CreateWalletAsync(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+
+        TokenService.CollectOperatorIdentityPublicKeys(wallet).Should().HaveCount(2);
     }
 
     private static int CompareBytes(byte[] a, byte[] b)

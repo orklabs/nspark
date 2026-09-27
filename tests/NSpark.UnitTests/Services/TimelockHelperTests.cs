@@ -36,13 +36,43 @@ public sealed class TimelockHelperTests
     }
 
     [Test]
+    public void ComputeNextSequences_rounds_down_to_the_interval_before_decrementing()
+    {
+        // The operators validate the successor refund against the rounded timelock: 740 → 600,
+        // where a raw decrement gave 640.
+        var (cpfp, direct) = TimelockHelper.ComputeNextSequences(MakeRawTx(740), "test.op");
+
+        cpfp.Should().Be(600);
+        direct.Should().Be(650);
+        TimelockHelper.ComputeNextSequences(MakeRawTx(Bit30 | 1999), "test.op").Should().Be((Bit30 | 1800, Bit30 | 1850));
+    }
+
+    [Test]
     public void ComputeNextSequences_allows_the_last_decrement_above_the_floor()
     {
-        // 101 is the smallest timelock that can still move: 101 - 100 = 1.
-        var (cpfp, direct) = TimelockHelper.ComputeNextSequences(MakeRawTx(101), "test.op");
+        // 200 is the smallest timelock that can still move: rounded 200 - 100 = 100.
+        var (cpfp, direct) = TimelockHelper.ComputeNextSequences(MakeRawTx(200), "test.op");
 
-        cpfp.Should().Be(1);
-        direct.Should().Be(51);
+        cpfp.Should().Be(100);
+        direct.Should().Be(150);
+    }
+
+    [TestCase(199u)]
+    [TestCase(101u)]
+    public void ComputeNextSequences_throws_when_the_rounded_timelock_is_at_the_floor(uint sequence)
+    {
+        var act = () => TimelockHelper.ComputeNextSequences(MakeRawTx(sequence), "test.op");
+
+        act.Should().Throw<SparkLeafTimelockExhaustedException>();
+    }
+
+    [Test]
+    public void HtlcSequences_are_not_rounded()
+    {
+        TimelockHelper.HtlcSequences(MakeRawTx(740), "test.op").Should().Be((710u, 725u));
+        TimelockHelper.HtlcSequences(MakeRawTx(Bit30 | 2000), "test.op").Should().Be((Bit30 | 1970, Bit30 | 1985));
+        var exhausted = () => TimelockHelper.HtlcSequences(MakeRawTx(100), "test.op");
+        exhausted.Should().Throw<SparkLeafTimelockExhaustedException>();
     }
 
     [Test]
@@ -73,13 +103,16 @@ public sealed class TimelockHelperTests
         act.Should().Throw<SparkLeafTimelockExhaustedException>();
     }
 
-    [TestCase(101u, true)]
+    [TestCase(200u, true)]
     [TestCase(2000u, true)]
+    [TestCase(199u, false)]
+    [TestCase(101u, false)]
     [TestCase(100u, false)]
     [TestCase(0u, false)]
     [TestCase(Bit30 | 100u, false)]
-    [TestCase(Bit30 | 101u, true)]
-    public void TimelockCanDecrement_is_strictly_greater_than_one_interval(uint sequence, bool expected)
+    [TestCase(Bit30 | 199u, false)]
+    [TestCase(Bit30 | 200u, true)]
+    public void TimelockCanDecrement_needs_a_rounded_timelock_above_one_interval(uint sequence, bool expected)
     {
         TimelockHelper.TimelockCanDecrement(MakeRawTx(sequence)).Should().Be(expected);
     }
@@ -91,7 +124,7 @@ public sealed class TimelockHelperTests
     /// </summary>
     private static byte[] MakeRawTx(uint sequence)
     {
-        var tx = new byte[4 + 1 + 36 + 1 + 4];
+        var tx = new byte[4 + 1 + 36 + 1 + 4 + 1 + 4]; // version, 1 input, 0 outputs, locktime
         tx[0] = 0x02; // version 2
         tx[4] = 0x01; // one input
         // prevout hash (32) + index (4) stay zero; script length byte stays 0x00

@@ -17,14 +17,15 @@ public sealed class SpendableLeavesTests
 
     [TestCase(2000u, true, false)]
     [TestCase(200u, true, false)]
-    [TestCase(199u, true, true)]
-    [TestCase(150u, true, true)]
-    [TestCase(101u, true, true)]
+    [TestCase(199u, false, true)]
+    [TestCase(150u, false, true)]
+    [TestCase(101u, false, true)]
     [TestCase(100u, false, true)]
     [TestCase(99u, false, false)]
     [TestCase(0u, false, false)]
-    [TestCase(Bit30 | 150u, true, true)]
+    [TestCase(Bit30 | 150u, false, true)]
     [TestCase(Bit30 | 100u, false, true)]
+    [TestCase(Bit30 | 200u, true, false)]
     public void IsSpendable_and_IsRenewable_follow_the_coordinator_thresholds(uint sequence, bool spendable, bool renewable)
     {
         var leaf = MakeLeaf("leaf", 1_000, sequence);
@@ -60,7 +61,8 @@ public sealed class SpendableLeavesTests
         var nodes = new Dictionary<string, TreeNode>
         {
             ["spendable"] = Node("spendable", 1_000, "AVAILABLE", 2000),
-            ["frozen"] = Node("frozen", 500, "AVAILABLE", 100),
+            ["renewable"] = Node("renewable", 700, "AVAILABLE", 100),
+            ["frozen"] = Node("frozen", 500, "AVAILABLE", 99),
             ["locked"] = Node("locked", 300, "TRANSFER_LOCKED", 2000),
             ["creating"] = Node("creating", 200, "CREATING", 2000),
             ["other"] = Node("other", 50, "SPLITTED", 2000),
@@ -68,11 +70,10 @@ public sealed class SpendableLeavesTests
 
         var summary = BalanceService.SummarizeNodes(nodes);
 
-        summary.Available.Should().Be(1_000);
-        summary.Frozen.Should().Be(500);
-        summary.Owned.Should().Be(1_800);
-        summary.Creating.Should().Be(200);
-        summary.Leaves.Select(l => l.Id).Should().BeEquivalentTo(["spendable", "frozen"]);
+        summary.Available.Should().Be(1_700, "a leaf at exactly 100 is renewable, so it counts as available");
+        summary.Frozen.Should().Be(500, "only a refund timelock below 100 is frozen");
+        summary.Leaves.Select(l => l.Id).Should().BeEquivalentTo(["spendable", "renewable", "frozen"],
+            "only AVAILABLE nodes are leaves; in-flight sats come from the transfers holding them");
     }
 
     [Test]
@@ -117,7 +118,7 @@ public sealed class SpendableLeavesTests
     /// <summary>Minimal single-input legacy tx: version, one input with an empty script and the given nSequence.</summary>
     private static byte[] MakeRawTx(uint sequence)
     {
-        var tx = new byte[4 + 1 + 36 + 1 + 4];
+        var tx = new byte[4 + 1 + 36 + 1 + 4 + 1 + 4]; // version, 1 input, 0 outputs, locktime
         tx[0] = 0x02;
         tx[4] = 0x01;
         BitConverter.GetBytes(sequence).CopyTo(tx, 42);

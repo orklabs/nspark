@@ -58,11 +58,15 @@ public sealed class RenewalServiceTests
     }
 
     [Test]
-    public void RefundTimelockBlocks_falls_back_to_the_node_tx_when_refund_is_empty()
+    public void RefundTimelockBlocks_reads_the_refund_tx_only()
     {
+        // A leaf's timelock is its refund's; without one it reads as exhausted rather than
+        // borrowing the node transaction's.
         var leaf = MakeLeaf(refundTx: null, nodeTx: MakeRawTx(2000));
 
-        leaf.RefundTimelockBlocks.Should().Be(2000);
+        leaf.RefundTimelockBlocks.Should().Be(0);
+        leaf.IsFrozen.Should().BeTrue();
+        leaf.IsSpendable.Should().BeFalse();
     }
 
     private static SparkLeaf MakeLeaf(byte[]? refundTx, byte[]? nodeTx = null)
@@ -85,7 +89,7 @@ public sealed class RenewalServiceTests
 
     private static byte[] MakeRawTx(uint sequence)
     {
-        var tx = new byte[4 + 1 + 36 + 1 + 4];
+        var tx = new byte[4 + 1 + 36 + 1 + 4 + 1 + 4]; // version, 1 input, 0 outputs, locktime
         tx[0] = 0x02; // version 2
         tx[4] = 0x01; // one input
         BitConverter.GetBytes(sequence).CopyTo(tx, 42);

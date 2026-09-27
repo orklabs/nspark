@@ -1,56 +1,139 @@
 using Google.Protobuf;
+using NSpark.Exceptions;
 using NSpark.Models;
 using NSpark.Proto;
 using NSpark.Signer;
 
 namespace NSpark.Services;
 
+/// <summary>Which side of a transfer the wallet is on.</summary>
+public enum TransferDirection
+{
+    /// <summary>Transfers the wallet sent or received.</summary>
+    Both,
+
+    /// <summary>Transfers the wallet sent.</summary>
+    Sent,
+
+    /// <summary>Transfers the wallet received.</summary>
+    Received,
+}
+
 /// <inheritdoc/>
 public static class TransferService
 {
+    private const string Operation = "transfer.send";
+
+    /// <summary>How long a transfer stays claimable before the sender may take it back: 16 days.</summary>
+    internal static readonly TimeSpan TransferExpiry = TimeSpan.FromDays(16);
+
+    /// <summary>
+    /// The transfer types <see cref="GetTransfersAsync"/> lists: the reference SDK's
+    /// <c>getTransfers</c> types — Spark transfers, Lightning payments (preimage swaps),
+    /// cooperative exits and static deposit claims (UTXO swaps).
+    /// </summary>
+    internal static readonly TransferType[] ListedTransferTypes =
+    [
+        TransferType.CooperativeExit,
+        TransferType.PreimageSwap,
+        TransferType.UtxoSwap,
+        TransferType.Transfer,
+    ];
+
+    /// <summary>
+    /// Send sats to another Spark wallet identified by its bech32m Spark address
+    /// (<c>spark1...</c> on mainnet, <c>sparkrt1...</c> on regtest). The address must be for the
+    /// wallet's network.
+    /// </summary>
+    /// <exception cref="SparkConfigurationException">
+    /// The address is malformed, for another network, or a Spark invoice: sending to an invoice
+    /// as if it were an address would ignore its amount, expiry and sender, and the payee would
+    /// not see it paid.
+    /// </exception>
+#pragma warning disable RS0026 // Optional parameters on parallel overloads — alpha API.
+    public static Task<SparkTransfer> SendAsync(
+        this SparkWallet wallet,
+        string receiverSparkAddress,
+        long amountSats,
+        CancellationToken ct = default)
+#pragma warning restore RS0026
+    {
+        ArgumentNullException.ThrowIfNull(wallet);
+        var receiver = SparkAddress.Decode(receiverSparkAddress, wallet.Options.Network);
+        return wallet.SendAsync(receiver, amountSats, transferId: null, ct);
+    }
+
     /// <summary>
     /// Send a Spark transfer to another wallet's identity public key.
     /// Uses the TransferPackage flow (start_transfer_v2) with FROST threshold signing.
     /// </summary>
+#pragma warning disable RS0026
     public static async Task<SparkTransfer> SendAsync(
         this SparkWallet wallet,
         byte[] receiverIdentityPublicKey,
         long amountSats,
         string? transferId = null,
         CancellationToken ct = default)
+#pragma warning restore RS0026
     {
-        // Step 1: Select leaves to cover amount (exact match or swap)
+        ArgumentNullException.ThrowIfNull(wallet);
+        ValidateSendArguments(receiverIdentityPublicKey, amountSats);
+
+        // Select leaves to cover amount (exact match or swap)
         var selectedLeaves = await wallet.SelectLeavesWithSwapAsync(amountSats, ct).ConfigureAwait(false);
+        return await wallet.TransferLeavesAsync(selectedLeaves, receiverIdentityPublicKey, transferId, ct).ConfigureAwait(false);
+    }
 
-        var coordinatorAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
-        var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
-        var networkStr = FrostSigningHelper.GetNetworkString(wallet.Client.Options.Network);
+    /// <summary>Validate the arguments of a Spark transfer before any leaf is selected or swapped.</summary>
+    internal static void ValidateSendArguments(byte[]? receiverIdentityPublicKey, long amountSats)
+    {
+        if (amountSats <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(amountSats), amountSats, "amountSats must be positive.");
+        }
 
-        // Step 2: Get SO operator info (identifiers + public keys)
+        if (receiverIdentityPublicKey is not { Length: 33 } || (receiverIdentityPublicKey[0] != 0x02 && receiverIdentityPublicKey[0] != 0x03))
+        {
+            throw new ArgumentException(
+                "receiverIdentityPublicKey must be a 33-byte compressed secp256k1 public key.",
+                nameof(receiverIdentityPublicKey));
+        }
+    }
+
+    /// <summary>Transfer exactly <paramref name="selectedLeaves"/> to the receiver in one Spark transfer.</summary>
+    internal static async Task<SparkTransfer> TransferLeavesAsync(
+        this SparkWallet wallet,
+        IReadOnlyList<SparkLeaf> selectedLeaves,
+        byte[] receiverIdentityPublicKey,
+        string? transferId,
+        CancellationToken ct)
+    {
+        var options = wallet.Options;
+        var coordinatorClient = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+        var networkStr = FrostSigningHelper.GetNetworkString(options.Network);
+
         var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
-            new Google.Protobuf.WellKnownTypes.Empty(),
-            headers,
-            cancellationToken: ct);
-        var soOperators = soListResponse.SigningOperators;
+            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct).ConfigureAwait(false);
+        var soTargets = FrostSigningHelper.BuildSoTargets(soListResponse.SigningOperators, options.SigningOperators);
+        var threshold = options.EffectiveSigningThreshold;
+        FrostSigningHelper.ValidateThreshold(threshold, soTargets.Count);
 
-        // Step 3: Get SO signing commitments for selected leaves
-        // Count=3: cpfp, direct, directFromCpfp refund
-        var leafIds = selectedLeaves.Select(l => l.Id).ToList();
+        // SO signing commitments, three per leaf (cpfp, direct, directFromCpfp), leaf-major.
         var commitmentsRequest = new GetSigningCommitmentsRequest { Count = 3 };
-        commitmentsRequest.NodeIds.AddRange(leafIds);
+        commitmentsRequest.NodeIds.AddRange(selectedLeaves.Select(l => l.Id));
         var commitmentsResponse = await coordinatorClient.get_signing_commitmentsAsync(
-            commitmentsRequest, headers, cancellationToken: ct);
+            commitmentsRequest, headers, cancellationToken: ct).ConfigureAwait(false);
+        var allCommitments = commitmentsResponse.SigningCommitments;
+        if (allCommitments.Count < 3 * selectedLeaves.Count)
+        {
+            throw new SparkUntrustedResponseException(
+                Operation, $"Got {allCommitments.Count} signing commitments, need {3 * selectedLeaves.Count}.");
+        }
 
-        // Commitments are interleaved: [leaf0_r0, leaf1_r0, ..., leaf0_r1, leaf1_r1, ...]
-        var allCommitments = commitmentsResponse.SigningCommitments.ToList();
-
-        // Step 4: Build encrypted per-SO tweak packages via the signer — no plaintext share
-        // material ever crosses the wallet boundary.
-        transferId ??= Guid.NewGuid().ToString();
-        var threshold = wallet.Client.Options.EffectiveSigningThreshold;
-
-        var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, wallet.Client.Options.SigningOperators);
+        // Encrypted per-SO tweak packages from the signer — no plaintext share material crosses
+        // the wallet boundary.
+        transferId ??= Guid.NewGuid().ToString("D");
         var leafDescriptors = selectedLeaves
             .Select(l => new SendTweakLeafDescriptor(l.Id, receiverIdentityPublicKey))
             .ToList();
@@ -63,50 +146,31 @@ public static class TransferService
             keyTweakPackage[soId] = ByteString.CopyFrom(blob);
         }
 
-        // Step 5: Sign FROST refund txs (one round per leaf × three refund types)
+        // FROST-sign each leaf's refunds to the receiver at the next timelock.
         var cpfpRefundJobs = new List<UserSignedTxSigningJob>();
         var directRefundJobs = new List<UserSignedTxSigningJob>();
         var directFromCpfpRefundJobs = new List<UserSignedTxSigningJob>();
 
-        for (int i = 0; i < selectedLeaves.Count; i++)
+        for (var i = 0; i < selectedLeaves.Count; i++)
         {
             var leaf = selectedLeaves[i];
             var node = leaf.Node;
             var verifyingKey = node.VerifyingPublicKey.ToByteArray();
 
-            // Compute decremented sequence from leaf's current refund tx
-            var nodeTxBytes = node.NodeTx.ToByteArray();
-            var directNodeTx = node.DirectTx.Length > 0 ? node.DirectTx.ToByteArray() : null;
-            var refundTxBytes = node.RefundTx.Length > 0
-                ? node.RefundTx.ToByteArray()
-                : nodeTxBytes;
-            var (normalSeq, normalDirectSeq) = TimelockHelper.ComputeNextSequences(
-                refundTxBytes, "transfer.send", leaf.Id);
+            var (cpfpSequence, directSequence) = TimelockHelper.ComputeNextSequences(
+                node.RefundTx.ToByteArray(), Operation, leaf.Id);
+            var refundTrio = TimelockHelper.LeafRefundTrio(
+                node, receiverIdentityPublicKey, networkStr, cpfpSequence, directSequence);
 
-            // Commitments are interleaved: [leaf0_cpfp, leaf1_cpfp, ..., leaf0_direct, leaf1_direct, ..., leaf0_dfcpfp, leaf1_dfcpfp, ...]
             var cpfpCommitments = allCommitments[i].SigningNonceCommitments;
             var directCommitments = allCommitments[i + selectedLeaves.Count].SigningNonceCommitments;
-            var directFromCpfpCommitments = allCommitments[i + 2 * selectedLeaves.Count].SigningNonceCommitments;
+            var directFromCpfpCommitments = allCommitments[i + (2 * selectedLeaves.Count)].SigningNonceCommitments;
 
-            // Construct refund tx trio (cpfp, direct, directFromCpfp) with decremented timelock
-            // receivingPubkey = receiver's identity pubkey (server validates this)
-            var refundTrio = SparkTxBuilder.BuildRefundTxTrio(
-                cpfpNodeTx: nodeTxBytes,
-                directNodeTx: directNodeTx,
-                vout: 0,
-                receivingPublicKey: receiverIdentityPublicKey,
-                network: networkStr,
-                sequence: normalSeq,
-                directSequence: normalDirectSeq,
-                feeSats: SparkConstants.DefaultRefundFeeSats);
-
-            // FROST sign cpfp refund
             cpfpRefundJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
                 wallet.Signer, leaf.Id, verifyingKey,
                 refundTrio.CpfpRefund.Tx, refundTrio.CpfpRefund.Sighash, cpfpCommitments, ct)
                 .ConfigureAwait(false));
 
-            // FROST sign direct refund (if direct tx exists)
             if (refundTrio.DirectRefund != null)
             {
                 directRefundJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
@@ -115,7 +179,6 @@ public static class TransferService
                     .ConfigureAwait(false));
             }
 
-            // FROST sign direct-from-cpfp refund
             directFromCpfpRefundJobs.Add(await FrostSigningHelper.BuildSigningJobAsync(
                 wallet.Signer, leaf.Id, verifyingKey,
                 refundTrio.DirectFromCpfpRefund.Tx, refundTrio.DirectFromCpfpRefund.Sighash,
@@ -123,35 +186,21 @@ public static class TransferService
                 .ConfigureAwait(false));
         }
 
-        // Step 6: Sign the key tweak package (BIP-340 tagged hash with domain "spark/transfer/signing payload")
-        var transferIdBytes = Convert.FromHexString(transferId.Replace("-", ""));
+        // Sign the key tweak package (BIP-340 tagged hash with domain "spark/transfer/signing payload").
         var packageHash = SparkTaggedHash.Create("spark", "transfer", "signing payload")
-            .AddBytes(transferIdBytes)
+            .AddBytes(ClaimService.TransferIdBytes(transferId))
             .AddMapStringToBytes(keyTweakPackage)
             .Hash();
         var packageSignature = await wallet.Signer.SignWithIdentityKeyAsync(packageHash, ct).ConfigureAwait(false);
 
-        // Step 7: Assemble TransferPackage and submit
         var transferPackage = new TransferPackage
         {
             UserSignature = ByteString.CopyFrom(packageSignature),
             HashVariant = HashVariant.V2,
         };
-        foreach (var job in cpfpRefundJobs)
-        {
-            transferPackage.LeavesToSend.Add(job);
-        }
-
-        foreach (var job in directRefundJobs)
-        {
-            transferPackage.DirectLeavesToSend.Add(job);
-        }
-
-        foreach (var job in directFromCpfpRefundJobs)
-        {
-            transferPackage.DirectFromCpfpLeavesToSend.Add(job);
-        }
-
+        transferPackage.LeavesToSend.AddRange(cpfpRefundJobs);
+        transferPackage.DirectLeavesToSend.AddRange(directRefundJobs);
+        transferPackage.DirectFromCpfpLeavesToSend.AddRange(directFromCpfpRefundJobs);
         foreach (var (soId, cipher) in keyTweakPackage)
         {
             transferPackage.KeyTweakPackage.Add(soId, cipher);
@@ -164,76 +213,104 @@ public static class TransferService
                 OwnerIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
                 ReceiverIdentityPublicKey = ByteString.CopyFrom(receiverIdentityPublicKey),
                 ExpiryTime = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(
-                    DateTimeOffset.UtcNow.AddMinutes(10)),
+                    DateTimeOffset.UtcNow + TransferExpiry),
                 TransferPackage = transferPackage,
             },
             headers,
-            cancellationToken: ct);
+            cancellationToken: ct).ConfigureAwait(false);
 
-        var transfer = response.Transfer;
-        return new SparkTransfer(
-            Id: transfer.Id,
-            SenderIdentityPublicKey: Convert.ToHexString(transfer.SenderIdentityPublicKey.ToByteArray()),
-            ReceiverIdentityPublicKey: Convert.ToHexString(transfer.ReceiverIdentityPublicKey.ToByteArray()),
-            TotalValueSats: (long)transfer.TotalValue,
-            Status: transfer.Status.ToString(),
-            CreatedAt: transfer.CreatedTime.ToDateTimeOffset());
+        return TransferMapping.ToModel(response.Transfer
+            ?? throw new SparkUntrustedResponseException(Operation, "start_transfer_v2 returned no transfer."));
     }
 
     /// <summary>
-    /// Get a single transfer by ID. Returns null if not found.
+    /// Get a single transfer by ID, of any type, from the operators' by-id lookup
+    /// (<c>query_transfers_by_id</c>, as the reference SDK queries it). Returns null if not found.
     /// </summary>
     public static async Task<SparkTransfer?> GetTransferAsync(
         this SparkWallet wallet,
         string transferId,
         CancellationToken ct = default)
     {
-        var coordinatorAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
-        var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(wallet);
+        ArgumentException.ThrowIfNullOrWhiteSpace(transferId);
+        var transfer = await wallet.TryQueryTransferByIdAsync(transferId, ct).ConfigureAwait(false);
+        return transfer is null ? null : TransferMapping.ToModel(transfer);
+    }
 
-        var protoNetwork = wallet.Client.Options.Network == SparkNetwork.Mainnet
-            ? Proto.Network.Mainnet : Proto.Network.Regtest;
+    /// <summary>
+    /// A transfer this wallet sent or receives, by id, from the operators' by-id lookup
+    /// (<c>query_transfers_by_id</c>, the reference SDK's <c>queryTransfer</c>): the whole
+    /// transfer, every receiver's leaves included.
+    /// </summary>
+    /// <exception cref="SparkUntrustedResponseException">The operators do not return the transfer.</exception>
+    internal static async Task<Transfer> QueryTransferByIdAsync(this SparkWallet wallet, string transferId, CancellationToken ct)
+    {
+        return await wallet.TryQueryTransferByIdAsync(transferId, ct).ConfigureAwait(false)
+            ?? throw new SparkUntrustedResponseException(Operation, $"Transfer not found: {transferId}.");
+    }
 
-        var filter = new Proto.TransferFilter
-        {
-            SenderOrReceiverIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
-            Network = protoNetwork,
-        };
-        filter.TransferIds.Add(transferId);
+    private static async Task<Transfer?> TryQueryTransferByIdAsync(this SparkWallet wallet, string transferId, CancellationToken ct)
+    {
+        var client = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+        var request = new QueryTransfersByIdRequest { Network = wallet.Options.ProtoNetwork() };
+        request.TransferIds.Add(transferId.Trim().ToLowerInvariant());
 
-        var response = await coordinatorClient.query_all_transfersAsync(
-            filter, headers, cancellationToken: ct);
-
-        var transfer = response.Transfers.FirstOrDefault();
-        return transfer == null ? null : MapTransfer(transfer);
+        var response = await client.query_transfers_by_idAsync(request, headers, cancellationToken: ct).ConfigureAwait(false);
+        return response.Transfers.FirstOrDefault(t => string.Equals(t.Id, transferId.Trim(), StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
     /// Query transfers with pagination and optional time filters.
     /// </summary>
+    /// <remarks>
+    /// Only the transfers a user makes are listed, as the reference SDK lists them: Spark
+    /// transfers, Lightning payments (preimage swaps), cooperative exits and static deposit claims
+    /// (UTXO swaps). The legs of leaf swaps are left out; the operators also answer that query in
+    /// well under a second, where an unfiltered one took them 17 s to over a minute for a wallet
+    /// with a long history. Use <see cref="GetTransferAsync"/> to look up a transfer of any type.
+    /// </remarks>
+    /// <param name="wallet">The Spark wallet.</param>
+    /// <param name="limit">Maximum transfers per page.</param>
+    /// <param name="offset">Pagination offset.</param>
+    /// <param name="createdAfter">Only transfers created strictly after this time.</param>
+    /// <param name="createdBefore">Only transfers created strictly before this time (ignored when <paramref name="createdAfter"/> is set).</param>
+    /// <param name="direction">Sent, received, or both (the default).</param>
+    /// <param name="ct">Cancellation token.</param>
     public static async Task<TransferPage> GetTransfersAsync(
         this SparkWallet wallet,
         int limit = 100,
         long offset = 0,
         DateTimeOffset? createdAfter = null,
         DateTimeOffset? createdBefore = null,
+        TransferDirection direction = TransferDirection.Both,
         CancellationToken ct = default)
     {
-        var coordinatorAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
-        var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(wallet);
+        var coordinatorClient = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
 
-        var protoNetwork = wallet.Client.Options.Network == SparkNetwork.Mainnet
-            ? Proto.Network.Mainnet : Proto.Network.Regtest;
-
-        var filter = new Proto.TransferFilter
+        var identity = ByteString.CopyFrom(wallet.IdentityPublicKey);
+        var filter = new TransferFilter
         {
-            SenderOrReceiverIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
-            Network = protoNetwork,
+            Network = wallet.Options.ProtoNetwork(),
             Limit = limit,
             Offset = offset,
         };
+        switch (direction)
+        {
+            case TransferDirection.Sent:
+                filter.SenderIdentityPublicKey = identity;
+                break;
+            case TransferDirection.Received:
+                filter.ReceiverIdentityPublicKey = identity;
+                break;
+            default:
+                filter.SenderOrReceiverIdentityPublicKey = identity;
+                break;
+        }
+        filter.Types_.AddRange(ListedTransferTypes);
 
         if (createdAfter.HasValue)
         {
@@ -245,22 +322,10 @@ public static class TransferService
         }
 
         var response = await coordinatorClient.query_all_transfersAsync(
-            filter, headers, cancellationToken: ct);
+            filter, headers, cancellationToken: ct).ConfigureAwait(false);
 
-        var transfers = response.Transfers.Select(MapTransfer).ToList();
+        var transfers = response.Transfers.Select(TransferMapping.ToModel).ToList();
         return new TransferPage(transfers, response.Offset);
-    }
-
-    private static SparkTransfer MapTransfer(Proto.Transfer t)
-    {
-        return new SparkTransfer(
-            Id: t.Id,
-            SenderIdentityPublicKey: Convert.ToHexString(t.SenderIdentityPublicKey.ToByteArray()).ToLowerInvariant(),
-            ReceiverIdentityPublicKey: Convert.ToHexString(t.ReceiverIdentityPublicKey.ToByteArray()).ToLowerInvariant(),
-            TotalValueSats: (long)t.TotalValue,
-            Status: t.Status.ToString(),
-            CreatedAt: t.CreatedTime.ToDateTimeOffset(),
-            Type: t.Type.ToString());
     }
 
     internal static IReadOnlyList<SparkLeaf> SelectLeaves(IReadOnlyList<SparkLeaf> leaves, long amountSats)

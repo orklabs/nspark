@@ -43,30 +43,19 @@ public static class RecoveryService
     {
         ArgumentNullException.ThrowIfNull(wallet);
 
-        var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var client = wallet.Pool.GetLargeMessageSparkClient(soAddress);
-        var headers = await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false);
+        var client = wallet.GetLargeMessageSparkClient(wallet.CoordinatorAddress);
 
-        var network = wallet.Client.Options.Network == SparkNetwork.Mainnet
-            ? Network.Mainnet
-            : Network.Regtest;
-
-        var all = new Dictionary<string, TreeNode>(StringComparer.Ordinal);
-
-        var response = await client.query_nodesAsync(
-            new QueryNodesRequest
-            {
-                OwnerIdentityPubkey = ByteString.CopyFrom(wallet.IdentityPublicKey),
-                IncludeParents = true,
-                Network = network,
-            },
-            headers,
-            cancellationToken: ct).ConfigureAwait(false);
-
-        foreach (var kv in response.Nodes)
+        // Paged at the operators' 100 nodes per page, on the large-message channel: with
+        // include_parents every page carries the leaves' ancestor chains too.
+        var request = new QueryNodesRequest
         {
-            all[kv.Key] = kv.Value;
-        }
+            OwnerIdentityPubkey = ByteString.CopyFrom(wallet.IdentityPublicKey),
+            IncludeParents = true,
+            Network = wallet.Options.ProtoNetwork(),
+        };
+        var all = new Dictionary<string, TreeNode>(
+            await wallet.QueryAllNodesAsync(request, client, ct).ConfigureAwait(false),
+            StringComparer.Ordinal);
 
         // Repair pass: fetch any parent referenced by a node in the map but not
         // present in it. Bounded so a coordinator that keeps returning nothing
@@ -85,6 +74,7 @@ public static class RecoveryService
             };
             repairRequest.NodeIds.NodeIds.AddRange(missing.OrderBy(id => id, StringComparer.Ordinal));
 
+            var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
             var repairResponse = await client.query_nodesAsync(
                 repairRequest, headers, cancellationToken: ct).ConfigureAwait(false);
 
@@ -102,8 +92,7 @@ public static class RecoveryService
             missing = MissingParentIds(all);
         }
 
-        var networkName = wallet.Client.Options.Network == SparkNetwork.Mainnet ? "MAINNET" : "REGTEST";
-        return BuildRecoverySnapshot(all, wallet.IdentityPublicKey, networkName);
+        return BuildRecoverySnapshot(all, wallet.IdentityPublicKey, wallet.Options.Network.GraphQLName());
     }
 
     /// <summary>Parent ids referenced by nodes in the map but absent from it.</summary>
@@ -157,7 +146,7 @@ public static class RecoveryService
                 continue;
             }
 
-            leaves.Add(new SparkRecoveryLeaf(id, node.Status, (long)node.Value, ToHex(node)));
+            leaves.Add(new SparkRecoveryLeaf(id, node.Status, TransferMapping.ReportedSats(node.Value), ToHex(node)));
             leafIds.Add(id);
         }
 

@@ -1,4 +1,5 @@
 using Google.Protobuf;
+using NSpark.Exceptions;
 using NSpark.GraphQL;
 using NSpark.Models;
 using NSpark.Proto;
@@ -11,17 +12,20 @@ namespace NSpark.Services;
 /// </summary>
 public static class SwapService
 {
+    private const string Operation = "swap.batch";
+
     /// <summary>
     /// Select leaves that exactly cover the target amount. If no exact match exists,
     /// triggers a leaf swap via SSP to split leaves into the required denominations.
     /// Only spendable leaves take part (see <see cref="BalanceService.GetSpendableLeavesAsync"/>):
-    /// leaves at the timelock floor are left out instead of failing the whole operation.
+    /// frozen leaves are left out instead of failing the whole operation.
     /// </summary>
     public static async Task<IReadOnlyList<SparkLeaf>> SelectLeavesWithSwapAsync(
         this SparkWallet wallet,
         long amountSats,
         CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(wallet);
         if (amountSats <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(amountSats), amountSats, "Target amount must be positive.");
@@ -37,18 +41,21 @@ public static class SwapService
         }
 
         // No exact match — swap leaves via SSP to get right denominations
-        var newLeaves = await wallet.RequestLeavesSwapAsync([amountSats], ct).ConfigureAwait(false);
+        _ = await wallet.RequestLeavesSwapAsync([amountSats], ct).ConfigureAwait(false);
 
-        // Retry selection with new leaves — swap should have created exact denominations
-        exact = TryExactSelection(newLeaves, amountSats);
+        // Retry selection with the swap's output (must find an exact match — never overspend).
+        // The SSP may return leaves in the renewal range; renew them rather than leave them out,
+        // as the reference SDK does before it uses swap outputs.
+        var afterSwap = await wallet.GetSpendableLeavesAsync(ct).ConfigureAwait(false);
+        exact = TryExactSelection(afterSwap, amountSats);
         if (exact != null)
         {
             return exact;
         }
 
-        // Swap didn't produce exact match — should not happen, but don't overspend
-        throw new InvalidOperationException(
-            $"Leaf swap did not produce exact denomination for {amountSats} sats. Spendable: {string.Join(", ", newLeaves.Where(l => l.Status == "AVAILABLE" && l.IsSpendable).Select(l => l.ValueSats))} sats.");
+        throw new SparkTransferException(
+            Operation,
+            $"Leaf swap did not produce an exact denomination for {amountSats} sats. Spendable: {string.Join(", ", afterSwap.Select(l => l.ValueSats))} sats.");
     }
 
     /// <summary>
@@ -89,13 +96,15 @@ public static class SwapService
 
     /// <summary>
     /// Request leaf swap via SSP: splits existing leaves into target denominations.
-    /// Returns newly claimed leaves after the swap.
+    /// Returns the wallet's leaves after the swap's counter-transfer is claimed.
     /// </summary>
     public static async Task<IReadOnlyList<SparkLeaf>> RequestLeavesSwapAsync(
         this SparkWallet wallet,
         long[] targetAmounts,
         CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(wallet);
+        ArgumentNullException.ThrowIfNull(targetAmounts);
         var totalTarget = targetAmounts.Sum();
         var leaves = await wallet.GetSpendableLeavesAsync(ct).ConfigureAwait(false);
 
@@ -117,8 +126,8 @@ public static class SwapService
 
         if (total < totalTarget)
         {
-            throw new InvalidOperationException(
-                $"Insufficient balance for swap: need {totalTarget} sats, have {total} sats.");
+            throw new SparkTransferException(
+                "swap.select", $"Insufficient balance for swap: need {totalTarget} sats, have {total} sats.");
         }
 
         return await wallet.ProcessSwapBatchAsync(selected, targetAmounts, ct).ConfigureAwait(false);
@@ -137,38 +146,42 @@ public static class SwapService
         long[] targetAmounts,
         CancellationToken ct = default)
     {
-        var coordinatorAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
-        var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
-        var networkStr = FrostSigningHelper.GetNetworkString(wallet.Client.Options.Network);
-        var receiverPubKey = Convert.FromHexString(wallet.Client.Options.SspIdentityPublicKeyHex);
+        var options = wallet.Options;
+        var coordinatorClient = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+        var networkStr = FrostSigningHelper.GetNetworkString(options.Network);
+        var receiverPubKey = options.RequireSspIdentityPublicKey();
 
         // Get SO operator list
         var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
-            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct);
-        var soOperators = soListResponse.SigningOperators;
-        var threshold = wallet.Client.Options.EffectiveSigningThreshold;
+            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct).ConfigureAwait(false);
+        var soTargets = FrostSigningHelper.BuildSoTargets(soListResponse.SigningOperators, options.SigningOperators);
+        var threshold = options.EffectiveSigningThreshold;
+        FrostSigningHelper.ValidateThreshold(threshold, soTargets.Count);
 
         // Generate adaptor keypair via the signer — the adaptor private key never leaves the signer.
         var adaptorKey = await wallet.Signer.GenerateAdaptorKeyAsync(ct).ConfigureAwait(false);
         var adaptorPubKey = adaptorKey.PublicKey;
 
-        var transferId = Guid.NewGuid().ToString();
+        var transferId = Guid.NewGuid().ToString("D");
         var expiryTime = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(
-            DateTimeOffset.UtcNow.AddDays(16));
+            DateTimeOffset.UtcNow + TransferService.TransferExpiry);
 
-        // Get signing commitments (count=3 for cpfp, direct, directFromCpfp)
-        var leafIds = leaves.Select(l => l.Id).ToList();
+        // Get signing commitments (count=3; only cpfp is used, direct/directFromCpfp are cleared for swaps)
         var commitmentsRequest = new GetSigningCommitmentsRequest { Count = 3 };
-        commitmentsRequest.NodeIds.AddRange(leafIds);
+        commitmentsRequest.NodeIds.AddRange(leaves.Select(l => l.Id));
         var commitmentsResponse = await coordinatorClient.get_signing_commitmentsAsync(
-            commitmentsRequest, headers, cancellationToken: ct);
-        var allCommitments = commitmentsResponse.SigningCommitments.ToList();
+            commitmentsRequest, headers, cancellationToken: ct).ConfigureAwait(false);
+        var allCommitments = commitmentsResponse.SigningCommitments;
+        if (allCommitments.Count < leaves.Count)
+        {
+            throw new SparkUntrustedResponseException(
+                Operation, $"Got {allCommitments.Count} signing commitments, need {leaves.Count}.");
+        }
 
         // Build encrypted per-SO tweak packages via the signer (no plaintext shares cross the wallet).
-        var soTargets = FrostSigningHelper.BuildSoTargets(soOperators, wallet.Client.Options.SigningOperators);
         var leafDescriptors = leaves
-            .Select(l => new NSpark.Signer.SendTweakLeafDescriptor(l.Id, receiverPubKey))
+            .Select(l => new Signer.SendTweakLeafDescriptor(l.Id, receiverPubKey))
             .ToList();
         var encryptedBatch = await wallet.Signer.BuildEncryptedSendTweaksAsync(
             leafDescriptors, soTargets, transferId, threshold, ct).ConfigureAwait(false);
@@ -181,33 +194,18 @@ public static class SwapService
 
         // FROST sign CPFP refund txs with adaptor (one round per leaf).
         var cpfpRefundJobs = new List<UserSignedTxSigningJob>();
-        var leafSigningInfos = new List<(string LeafId, NSpark.Signer.SigningCommitment SelfCommitment, byte[] Sighash)>();
+        var leafSigningInfos = new List<(string LeafId, Signer.SigningCommitment SelfCommitment, byte[] Sighash)>();
 
-        for (int i = 0; i < leaves.Count; i++)
+        for (var i = 0; i < leaves.Count; i++)
         {
             var leaf = leaves[i];
             var node = leaf.Node;
             var verifyingKey = node.VerifyingPublicKey.ToByteArray();
             var cpfpCommitments = allCommitments[i].SigningNonceCommitments;
 
-            // Compute sequences
-            var refundTxBytes = node.RefundTx.Length > 0
-                ? node.RefundTx.ToByteArray()
-                : node.NodeTx.ToByteArray();
             var (cpfpSequence, directSequence) = TimelockHelper.ComputeNextSequences(
-                refundTxBytes, "swap.batch", leaf.Id);
-
-            var nodeTxBytes = node.NodeTx.ToByteArray();
-            var directNodeTx = node.DirectTx.Length > 0 ? node.DirectTx.ToByteArray() : null;
-            var refundTrio = SparkTxBuilder.BuildRefundTxTrio(
-                cpfpNodeTx: nodeTxBytes,
-                directNodeTx: directNodeTx,
-                vout: 0,
-                receivingPublicKey: receiverPubKey,
-                network: networkStr,
-                sequence: cpfpSequence,
-                directSequence: directSequence,
-                feeSats: SparkConstants.DefaultRefundFeeSats);
+                node.RefundTx.ToByteArray(), Operation, leaf.Id);
+            var refundTrio = TimelockHelper.LeafRefundTrio(node, receiverPubKey, networkStr, cpfpSequence, directSequence);
 
             var (job, selfCommitment, sighash) = await FrostSigningHelper.BuildSigningJobWithAdaptorAsync(
                 wallet.Signer, leaf.Id, verifyingKey,
@@ -219,24 +217,19 @@ public static class SwapService
         }
 
         // Sign the transfer package
-        var transferIdBytes = Convert.FromHexString(transferId.Replace("-", ""));
         var packageHash = SparkTaggedHash.Create("spark", "transfer", "signing payload")
-            .AddBytes(transferIdBytes)
+            .AddBytes(ClaimService.TransferIdBytes(transferId))
             .AddMapStringToBytes(keyTweakPackage)
             .Hash();
         var packageSignature = await wallet.Signer.SignWithIdentityKeyAsync(packageHash, ct).ConfigureAwait(false);
 
-        // Build TransferPackage (direct/directFromCpfp cleared for swap)
+        // Build TransferPackage (direct/directFromCpfp cleared for swap, as the reference SDK does)
         var transferPackage = new TransferPackage
         {
             UserSignature = ByteString.CopyFrom(packageSignature),
             HashVariant = HashVariant.V2,
         };
-        foreach (var job in cpfpRefundJobs)
-        {
-            transferPackage.LeavesToSend.Add(job);
-        }
-        // Direct and directFromCpfp are intentionally empty for swap
+        transferPackage.LeavesToSend.AddRange(cpfpRefundJobs);
         foreach (var (soId, cipher) in keyTweakPackage)
         {
             transferPackage.KeyTweakPackage.Add(soId, cipher);
@@ -260,30 +253,25 @@ public static class SwapService
         };
 
         var swapResponse = await coordinatorClient.initiate_swap_primary_transferAsync(
-            swapRequest, headers, cancellationToken: ct);
+            swapRequest, headers, cancellationToken: ct).ConfigureAwait(false);
 
         if (swapResponse.Transfer == null)
         {
-            throw new InvalidOperationException("No transfer in swap response.");
+            throw new SparkUntrustedResponseException(Operation, "No transfer in swap response.");
         }
 
         // Aggregate FROST signatures with adaptor pubkey for each leaf
-        var adaptorSignatures = new Dictionary<string, byte[]>();
+        var adaptorSignatures = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         foreach (var signingResult in swapResponse.SigningResults)
         {
             var info = leafSigningInfos.FirstOrDefault(x => x.LeafId == signingResult.LeafId);
-            if (info.LeafId == null)
-            {
-                continue;
-            }
-
             var job = cpfpRefundJobs.FirstOrDefault(j => j.LeafId == signingResult.LeafId);
-            if (job == null)
+            if (info.LeafId == null || job == null)
             {
                 continue;
             }
 
-            var aggregated = FrostSigningHelper.AggregateFrostSignature(
+            adaptorSignatures[signingResult.LeafId] = FrostSigningHelper.AggregateFrostSignature(
                 sighash: info.Sighash,
                 selfCommitment: info.SelfCommitment,
                 selfSignature: job.UserSignature.ToByteArray(),
@@ -291,8 +279,6 @@ public static class SwapService
                 verifyingKey: signingResult.VerifyingKey.ToByteArray(),
                 signingResult: signingResult.RefundTxSigningResult,
                 adaptorPublicKey: adaptorPubKey);
-
-            adaptorSignatures[signingResult.LeafId] = aggregated;
         }
 
         // Build user leaves for SSP request_swap mutation
@@ -305,9 +291,7 @@ public static class SwapService
             }
 
             var adaptorSigHex = Convert.ToHexString(adaptorSig).ToLowerInvariant();
-
-            var transferLeaf = swapResponse.Transfer.Leaves
-                .FirstOrDefault(l => l.Leaf.Id == signingResult.LeafId);
+            var transferLeaf = swapResponse.Transfer.Leaves.FirstOrDefault(l => l.Leaf.Id == signingResult.LeafId);
 
             userLeaves.Add(new Dictionary<string, string>
             {
@@ -339,39 +323,19 @@ public static class SwapService
         var sspResponse = await wallet.SspClient.ExecuteAsync<RequestSwapResponse>(
             Mutations.RequestSwap, variables, ct).ConfigureAwait(false);
 
-        var swapStatus = sspResponse.RequestSwap.Request.Status;
-        if (swapStatus == "FAILED")
+        var request = sspResponse.RequestSwap?.Request;
+        if (request is null || request.Status == "FAILED")
         {
-            throw new InvalidOperationException("Leaf swap request failed.");
+            throw new SparkTransferException(Operation, "Leaf swap request failed.");
         }
 
-        var inboundSparkId = sspResponse.RequestSwap.Request.InboundTransfer?.SparkId
-            ?? throw new InvalidOperationException("No inbound transfer in swap response.");
+        var inboundSparkId = request.InboundTransfer?.SparkId
+            ?? throw new SparkUntrustedResponseException(Operation, "No inbound transfer in swap response.");
 
-        // Query the inbound transfer and claim it
-        var protoNetwork = wallet.Client.Options.Network == SparkNetwork.Mainnet
-            ? Proto.Network.Mainnet : Proto.Network.Regtest;
-        var filter = new TransferFilter
-        {
-            ReceiverIdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
-            Network = protoNetwork,
-        };
-        filter.TransferIds.Add(inboundSparkId);
-
-        var queryResponse = await coordinatorClient.query_pending_transfersAsync(
-            filter, headers, cancellationToken: ct);
-
-        var inboundTransfer = queryResponse.Transfers.FirstOrDefault()
-            ?? throw new InvalidOperationException($"Inbound swap transfer not found: {inboundSparkId}");
-
-        // Claim the inbound transfer
-        var soListResponse2 = await coordinatorClient.get_signing_operator_listAsync(
-            new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct);
-
-        await ClaimService.ClaimSingleTransferAsync(
-            wallet, coordinatorClient, headers, networkStr,
-            soListResponse2.SigningOperators,
-            inboundTransfer, inboundTransfer.Leaves.ToList(), ct).ConfigureAwait(false);
+        // The counter-transfer, by id, claimed under the wallet's claim lock: a concurrent claim
+        // pass may already have claimed it.
+        var inboundTransfer = await wallet.QueryTransferByIdAsync(inboundSparkId, ct).ConfigureAwait(false);
+        await ClaimService.ClaimTransferAsync(wallet, inboundTransfer, ct).ConfigureAwait(false);
 
         // Return the new leaves
         return await wallet.GetLeavesAsync(ct).ConfigureAwait(false);

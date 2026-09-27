@@ -22,9 +22,9 @@ public static class PrivacyService
     public static async Task<WalletSettings> SetPrivacyEnabledAsync(
         this SparkWallet wallet, bool enabled, CancellationToken ct = default)
     {
-        var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var client = wallet.Pool.GetSparkClient(soAddress);
-        var headers = await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(wallet);
+        var client = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
 
         var request = new UpdateWalletSettingRequest
         {
@@ -44,9 +44,9 @@ public static class PrivacyService
     public static async Task<WalletSettings> GetWalletSettingsAsync(
         this SparkWallet wallet, CancellationToken ct = default)
     {
-        var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var client = wallet.Pool.GetSparkClient(soAddress);
-        var headers = await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(wallet);
+        var client = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
 
         var response = await client.query_wallet_settingAsync(
             new QueryWalletSettingRequest(), headers, cancellationToken: ct).ConfigureAwait(false);

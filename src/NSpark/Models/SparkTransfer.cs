@@ -17,4 +17,8 @@ public sealed record SparkTransfer(
     long TotalValueSats,
     string Status,
     DateTimeOffset CreatedAt,
-    string? Type = null);
+    string? Type = null)
+{
+    /// <summary>The Spark invoice this transfer pays, if any.</summary>
+    public string? SparkInvoice { get; init; }
+}

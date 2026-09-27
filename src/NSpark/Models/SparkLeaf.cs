@@ -20,12 +20,11 @@ public sealed record SparkLeaf(string Id, string TreeId, long ValueSats, string 
     internal TreeNode Node { get; init; } = null!;
 
     /// <summary>
-    /// Remaining refund-tx timelock in blocks. Below 200 the leaf needs
-    /// renewal; at or below 100 it cannot move at all until renewed. See
-    /// <c>RenewalService.RenewExhaustedLeavesAsync</c>. An unparseable refund
-    /// transaction reads as 0 ("exhausted"): the leaf is never selected for a
-    /// spend and a renewal attempt reports the failure per leaf instead of
-    /// throwing from a property getter.
+    /// Remaining refund-tx timelock in blocks. Below 200 the leaf must be renewed before it can
+    /// move; below 100 the coordinator will not renew it either (<see cref="IsFrozen"/>). An
+    /// unparseable refund transaction reads as 0 ("exhausted"): the leaf is never selected for a
+    /// spend and a renewal attempt reports the failure per leaf instead of throwing from a
+    /// property getter.
     /// </summary>
     public uint RefundTimelockBlocks
     {
@@ -38,9 +37,9 @@ public sealed record SparkLeaf(string Id, string TreeId, long ValueSats, string 
 
             try
             {
-                return ClaimService.ExtractRefundSequence(Node) & 0xFFFF;
+                return TimelockHelper.ParseSequence(Node.RefundTx.ToByteArray()) & 0xFFFF;
             }
-            catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentException)
+            catch (Exceptions.SparkUntrustedResponseException)
             {
                 return 0;
             }
@@ -48,19 +47,26 @@ public sealed record SparkLeaf(string Id, string TreeId, long ValueSats, string 
     }
 
     /// <summary>
-    /// Whether the leaf can be transferred, paid, or exited right now: its refund timelock is
-    /// above the floor the coordinator enforces. Leaves in the renewable range just above the
-    /// floor are still spendable; <c>BalanceService.GetSpendableLeavesAsync</c> renews them
-    /// first. Every spend path selects only from spendable leaves.
+    /// Whether the leaf can be transferred, paid, or exited right now without a renewal: its
+    /// refund timelock, rounded down to the 100-block interval, is above the floor the coordinator
+    /// enforces — at least 200. Leaves at 100…199 are renewable (<see cref="IsRenewable"/>);
+    /// <c>BalanceService.GetSpendableLeavesAsync</c> renews them first.
     /// </summary>
-    public bool IsSpendable => RefundTimelockBlocks > TimelockHelper.TimeLockInterval;
+    public bool IsSpendable => TimelockHelper.IsTransferableRefundTimelock(RefundTimelockBlocks);
 
     /// <summary>
-    /// Whether the coordinator is expected to renew this leaf's timelocks: its refund timelock
-    /// is in <c>[100, 200)</c>. A leaf below that range is frozen; only a unilateral exit can
-    /// recover it.
+    /// Whether the coordinator will renew this leaf's timelocks: its refund timelock is in
+    /// <c>[100, 200)</c>. A leaf below that range is frozen: only a unilateral exit can recover it.
     /// </summary>
     public bool IsRenewable =>
         RefundTimelockBlocks >= TimelockHelper.TimeLockInterval
         && RefundTimelockBlocks < RenewalService.RenewalThreshold;
+
+    /// <summary>
+    /// Whether the leaf is frozen: its refund timelock is below 100, the minimum the coordinator
+    /// renews, and it is too low to move, so only a unilateral on-chain exit can recover it. A leaf
+    /// at exactly 100 is renewable, not frozen. Leaves only get here through SDKs that decremented
+    /// timelocks without renewing.
+    /// </summary>
+    public bool IsFrozen => RefundTimelockBlocks < TimelockHelper.TimeLockInterval;
 }

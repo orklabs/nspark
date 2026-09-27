@@ -101,17 +101,73 @@ internal static class TransferLeafVerifier
     }
 
     /// <summary>
-    /// Throws <see cref="SparkUntrustedResponseException"/> unless every leaf is present and
-    /// carries a valid sender signature. When the transfer names a receiver it must be this
-    /// wallet.
+    /// A transfer narrowed to <paramref name="receiverIdentityPublicKey"/>'s own receiver edge and
+    /// its leaves — the reference SDK's <c>scopeTransferLeavesToReceiver</c>. The operators record
+    /// only the first (lowest-key) receiver of a multi-receiver transfer in
+    /// <c>receiver_identity_public_key</c>, but deliver it to every receiver and may return every
+    /// receiver's leaves. A transfer with one receiver is returned unchanged.
+    /// </summary>
+    /// <exception cref="SparkUntrustedResponseException">
+    /// The wallet is not among the receivers, or no leaves are assigned to it.
+    /// </exception>
+    internal static Transfer Scoped(Transfer transfer, byte[] receiverIdentityPublicKey)
+    {
+        ArgumentNullException.ThrowIfNull(transfer);
+        if (transfer.Receivers.Count <= 1)
+        {
+            return transfer;
+        }
+
+        var own = transfer.Receivers.FirstOrDefault(r => r.IdentityPublicKey.Span.SequenceEqual(receiverIdentityPublicKey));
+        if (own is null || string.IsNullOrEmpty(own.Id))
+        {
+            throw new SparkUntrustedResponseException(
+                Operation, $"Transfer {transfer.Id} does not list this wallet among its receivers.");
+        }
+
+        var scoped = transfer.Clone();
+        scoped.Leaves.Clear();
+        scoped.Leaves.AddRange(transfer.Leaves.Where(l => string.Equals(l.TransferReceiverId, own.Id, StringComparison.Ordinal)));
+        if (scoped.Leaves.Count == 0)
+        {
+            throw new SparkUntrustedResponseException(
+                Operation, $"Transfer {transfer.Id} assigns no leaves to this wallet.");
+        }
+
+        return scoped;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="receiverIdentityPublicKey"/>'s leg of a transfer is complete: the
+    /// whole transfer, or for a multi-receiver transfer this receiver's edge — the whole transfer
+    /// completes only once every receiver has claimed (the reference SDK's
+    /// <c>isReceiverLegComplete</c>).
+    /// </summary>
+    internal static bool IsReceiverLegComplete(Transfer transfer, byte[] receiverIdentityPublicKey)
+    {
+        ArgumentNullException.ThrowIfNull(transfer);
+        var wholeComplete = transfer.Status == TransferStatus.Completed;
+        if (transfer.Receivers.Count <= 1)
+        {
+            return wholeComplete;
+        }
+
+        var own = transfer.Receivers.FirstOrDefault(r => r.IdentityPublicKey.Span.SequenceEqual(receiverIdentityPublicKey));
+        return own is not null && (own.Status == TransferReceiverStatus.Completed || wholeComplete);
+    }
+
+    /// <summary>
+    /// Throws <see cref="SparkUntrustedResponseException"/> unless the transfer is addressed to
+    /// <paramref name="receiverIdentityPublicKey"/> — as its recorded receiver or one of its
+    /// receivers — and every leaf is present and carries a valid sender signature.
     /// </summary>
     internal static void Verify(Transfer transfer, byte[] receiverIdentityPublicKey)
     {
         ArgumentNullException.ThrowIfNull(transfer);
         ArgumentNullException.ThrowIfNull(receiverIdentityPublicKey);
 
-        if (!transfer.ReceiverIdentityPublicKey.IsEmpty
-            && !transfer.ReceiverIdentityPublicKey.Span.SequenceEqual(receiverIdentityPublicKey))
+        if (!transfer.ReceiverIdentityPublicKey.Span.SequenceEqual(receiverIdentityPublicKey)
+            && !transfer.Receivers.Any(r => r.IdentityPublicKey.Span.SequenceEqual(receiverIdentityPublicKey)))
         {
             throw new SparkUntrustedResponseException(Operation, $"Transfer {transfer.Id} is not addressed to this wallet.");
         }

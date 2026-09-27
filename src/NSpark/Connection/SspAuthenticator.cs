@@ -1,8 +1,7 @@
 using System.Collections.Concurrent;
-using System.Net.Http.Json;
+using System.Globalization;
 using System.Security.Cryptography;
-using System.Text.Json;
-using System.Text.Json.Serialization;
+using NSpark.Exceptions;
 using NSpark.GraphQL;
 using NSpark.Signer;
 
@@ -10,103 +9,114 @@ namespace NSpark.Connection;
 
 /// <summary>
 /// Challenge-response authentication with the Spark Service Provider (SSP) via GraphQL.
-/// Tokens are cached by identity public key hex with TTL.
+/// Tokens are cached per identity public key until shortly before their <c>valid_until</c>;
+/// concurrent callers for one identity share one authentication.
 /// </summary>
 internal sealed class SspAuthenticator
 {
-    private static readonly ConcurrentDictionary<string, CachedToken> s_tokenCache = new();
     private static readonly TimeSpan TokenRefreshBuffer = TimeSpan.FromMinutes(1);
 
-    private record CachedToken(string Token, DateTimeOffset ExpiresAt);
+    private readonly HttpClient _httpClient;
+    private readonly string _sspUrl;
+    private readonly SspRetryPolicy _retry;
+    private readonly ConcurrentDictionary<string, CachedToken> _cache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Lazy<Task<CachedToken>>> _inFlight = new(StringComparer.Ordinal);
 
-    private static readonly JsonSerializerOptions s_jsonOptions = new()
+    private sealed record CachedToken(string Token, DateTimeOffset ExpiresAt);
+
+    public SspAuthenticator(HttpClient httpClient, string sspUrl, SspRetryPolicy? retry = null)
     {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    };
+        _httpClient = httpClient;
+        _sspUrl = sspUrl;
+        _retry = retry ?? SspRetryPolicy.Standard;
+    }
 
-    public static async Task<string> GetTokenAsync(
-        HttpClient httpClient,
-        string sspUrl,
-        ISparkSigner signer,
-        CancellationToken ct = default)
+    public async Task<string> GetTokenAsync(ISparkSigner signer, byte[] identityPubKey, CancellationToken ct = default)
     {
-        var identityPubKey = await signer.GetIdentityPublicKeyAsync(ct).ConfigureAwait(false);
-        var cacheKey = $"ssp:{Convert.ToHexString(identityPubKey)}";
-
-        if (s_tokenCache.TryGetValue(cacheKey, out var cached) &&
+        var cacheKey = Convert.ToHexString(identityPubKey);
+        if (_cache.TryGetValue(cacheKey, out var cached) &&
             cached.ExpiresAt > DateTimeOffset.UtcNow + TokenRefreshBuffer)
         {
             return cached.Token;
         }
 
-        var token = await AuthenticateAsync(httpClient, sspUrl, signer, identityPubKey, ct).ConfigureAwait(false);
-        s_tokenCache[cacheKey] = token;
+        var candidate = new Lazy<Task<CachedToken>>(
+            () => AuthenticateAndCacheAsync(signer, identityPubKey, cacheKey),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        var shared = _inFlight.GetOrAdd(cacheKey, candidate);
+        if (ReferenceEquals(shared, candidate))
+        {
+            _ = candidate.Value.ContinueWith(
+                task =>
+                {
+                    _ = task.Exception;
+                    _inFlight.TryRemove(new KeyValuePair<string, Lazy<Task<CachedToken>>>(cacheKey, candidate));
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        var token = await shared.Value.WaitAsync(ct).ConfigureAwait(false);
         return token.Token;
     }
 
-    private static async Task<CachedToken> AuthenticateAsync(
-        HttpClient httpClient,
-        string sspUrl,
-        ISparkSigner signer,
-        byte[] identityPubKey,
-        CancellationToken ct)
+    /// <summary>
+    /// Forget the cached session if it is still <paramref name="token"/>. Called when the SSP
+    /// rejects the token before its <c>valid_until</c> (rotation, restart): the next call
+    /// authenticates afresh instead of replaying the rejected token until the process restarts.
+    /// </summary>
+    public void Invalidate(byte[] identityPubKey, string token)
+    {
+        var cacheKey = Convert.ToHexString(identityPubKey);
+        if (_cache.TryGetValue(cacheKey, out var cached) && string.Equals(cached.Token, token, StringComparison.Ordinal))
+        {
+            _cache.TryRemove(new KeyValuePair<string, CachedToken>(cacheKey, cached));
+        }
+    }
+
+    private async Task<CachedToken> AuthenticateAndCacheAsync(ISparkSigner signer, byte[] identityPubKey, string cacheKey)
+    {
+        var token = await AuthenticateAsync(signer, identityPubKey).ConfigureAwait(false);
+        _cache[cacheKey] = token;
+        return token;
+    }
+
+    private async Task<CachedToken> AuthenticateAsync(ISparkSigner signer, byte[] identityPubKey)
     {
         var identityPubKeyHex = Convert.ToHexString(identityPubKey).ToLowerInvariant();
 
         // Step 1: Get challenge (no auth required)
-        var challengeResponse = await ExecuteGraphQLAsync<GetChallengeResponse>(
-            httpClient, sspUrl, Mutations.GetChallenge,
-            new { public_key = identityPubKeyHex }, ct).ConfigureAwait(false);
+        var challengeResponse = await SspGraphQL.PostAsync<GetChallengeResponse>(
+            _httpClient, _sspUrl, token: null, Mutations.GetChallenge,
+            new { public_key = identityPubKeyHex }, _retry, CancellationToken.None).ConfigureAwait(false);
 
-        var protectedChallenge = challengeResponse.GetChallenge.ProtectedChallenge;
+        var protectedChallenge = challengeResponse.GetChallenge?.ProtectedChallenge
+            ?? throw new SparkAuthenticationException("ssp.authenticate", "The SSP returned no challenge.");
 
         // Step 2: Sign the challenge (SSP uses base64url encoding)
         var challengeBytes = DecodeBase64Url(protectedChallenge);
         var challengeHash = SHA256.HashData(challengeBytes);
-        var signature = await signer.SignWithIdentityKeyAsync(challengeHash, ct).ConfigureAwait(false);
+        var signature = await signer.SignWithIdentityKeyAsync(challengeHash).ConfigureAwait(false);
         var signatureBase64 = Convert.ToBase64String(signature);
 
         // Step 3: Verify challenge and get token
-        var verifyResponse = await ExecuteGraphQLAsync<VerifyChallengeResponse>(
-            httpClient, sspUrl, Mutations.VerifyChallenge,
+        var verifyResponse = await SspGraphQL.PostAsync<VerifyChallengeResponse>(
+            _httpClient, _sspUrl, token: null, Mutations.VerifyChallenge,
             new
             {
                 protected_challenge = protectedChallenge,
                 signature = signatureBase64,
                 identity_public_key = identityPubKeyHex,
-            }, ct).ConfigureAwait(false);
+            }, _retry, CancellationToken.None).ConfigureAwait(false);
 
-        var data = verifyResponse.VerifyChallenge;
-        var expiresAt = DateTimeOffset.Parse(data.ValidUntil, System.Globalization.CultureInfo.InvariantCulture);
+        var data = verifyResponse.VerifyChallenge
+            ?? throw new SparkAuthenticationException("ssp.authenticate", "The SSP returned no session.");
+        var expiresAt = DateTimeOffset.TryParse(
+            data.ValidUntil, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var validUntil)
+            ? validUntil
+            : DateTimeOffset.UtcNow.AddHours(1);
         return new CachedToken(data.SessionToken, expiresAt);
-    }
-
-    private static async Task<T> ExecuteGraphQLAsync<T>(
-        HttpClient httpClient,
-        string sspUrl,
-        string query,
-        object variables,
-        CancellationToken ct)
-    {
-        var request = new HttpRequestMessage(HttpMethod.Post, sspUrl)
-        {
-            Content = JsonContent.Create(new { query, variables }, options: s_jsonOptions)
-        };
-
-        var response = await httpClient.SendAsync(request, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
-
-        var result = await response.Content.ReadFromJsonAsync<GraphQLEnvelope<T>>(s_jsonOptions, ct).ConfigureAwait(false)
-            ?? throw new InvalidOperationException("SSP returned null response.");
-
-        if (result.Errors is { Count: > 0 })
-        {
-            var messages = string.Join("; ", result.Errors.Select(e => e.Message));
-            throw new InvalidOperationException($"SSP auth error: {messages}");
-        }
-
-        return result.Data ?? throw new InvalidOperationException("SSP returned null data.");
     }
 
     private static byte[] DecodeBase64Url(string base64Url)
@@ -117,13 +127,14 @@ internal sealed class SspAuthenticator
             case 2: s += "=="; break;
             case 3: s += "="; break;
         }
-        return Convert.FromBase64String(s);
+
+        try
+        {
+            return Convert.FromBase64String(s);
+        }
+        catch (FormatException ex)
+        {
+            throw new SparkAuthenticationException("ssp.authenticate", "The SSP challenge is not base64url.", ex);
+        }
     }
-
-    private record GraphQLEnvelope<T>(
-        [property: JsonPropertyName("data")] T? Data,
-        [property: JsonPropertyName("errors")] List<GraphQLErrorItem>? Errors);
-
-    private record GraphQLErrorItem(
-        [property: JsonPropertyName("message")] string Message);
 }
