@@ -240,7 +240,7 @@ internal static class CoopExitValidator
             var stripped = WithdrawalService.StripWitness(bytes);
             return Transaction.Load(stripped, ToBitcoinNetwork(network));
         }
-        catch (Exception ex) when (ex is FormatException or EndOfStreamException or ArgumentException or IndexOutOfRangeException or InvalidOperationException)
+        catch (Exception ex) when (ex is SparkUntrustedResponseException or FormatException or EndOfStreamException or ArgumentException or IndexOutOfRangeException or InvalidOperationException)
         {
             throw new SparkUntrustedResponseException(Operation, $"The SSP coop exit response: {field} is not a parseable transaction.", ex);
         }

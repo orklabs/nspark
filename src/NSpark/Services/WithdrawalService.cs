@@ -1,5 +1,5 @@
-using System.Security.Cryptography;
 using Google.Protobuf;
+using NSpark.Bitcoin;
 using NSpark.Exceptions;
 using NSpark.GraphQL;
 using NSpark.Models;
@@ -17,7 +17,8 @@ public static class WithdrawalService
     private const string Operation = "withdrawal.withdraw";
 
     /// <summary>
-    /// Get a fee estimate for an on-chain withdrawal (cooperative exit).
+    /// Get a fee estimate for an on-chain withdrawal (cooperative exit). Each fee is read in the
+    /// unit the SSP reports it in; any other unit is refused.
     /// </summary>
     public static async Task<FeeQuote> GetFeeQuoteAsync(
         this SparkWallet wallet,
@@ -25,6 +26,7 @@ public static class WithdrawalService
         string onChainAddress,
         CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(wallet);
         var variables = new Dictionary<string, object>
         {
             ["leaf_external_ids"] = leafIds,
@@ -34,13 +36,22 @@ public static class WithdrawalService
         var response = await wallet.SspClient.ExecuteAsync<CoopExitFeeEstimateResponse>(
             Mutations.CoopExitFeeEstimate, variables, ct).ConfigureAwait(false);
 
-        // The SSP returns each fee as a CurrencyAmount with an `original_unit` discriminator.
-        // Convert via the shared helper so all three SSP fee call sites (this one, lightning
-        // send fee estimate, lightning send status) use identical dispatch.
-        var fast = response.CoopExitFeeEstimates.SpeedFast;
-        var totalFeeSats =
-            CurrencyAmountExtensions.ToSats(fast.UserFee.OriginalValue, fast.UserFee.OriginalUnit) +
-            CurrencyAmountExtensions.ToSats(fast.L1BroadcastFee.OriginalValue, fast.L1BroadcastFee.OriginalUnit);
+        var fast = response.CoopExitFeeEstimates?.SpeedFast
+            ?? throw new SparkUntrustedResponseException("withdrawal.fee", "The SSP returned no fast exit estimate.");
+        var userFee = CurrencyAmountExtensions.ToFeeSats(
+            fast.UserFee?.OriginalValue ?? -1, fast.UserFee?.OriginalUnit, "cooperative exit user fee");
+        var l1Fee = CurrencyAmountExtensions.ToFeeSats(
+            fast.L1BroadcastFee?.OriginalValue ?? -1, fast.L1BroadcastFee?.OriginalUnit, "cooperative exit broadcast fee");
+        long totalFeeSats;
+        try
+        {
+            totalFeeSats = checked(userFee + l1Fee);
+        }
+        catch (OverflowException ex)
+        {
+            throw new SparkUntrustedResponseException("withdrawal.fee", "The SSP's cooperative exit fees overflow.", ex);
+        }
+
         return new FeeQuote(FeeSats: totalFeeSats, FeeRateSatsPerVbyte: 0);
     }
 
@@ -53,7 +64,7 @@ public static class WithdrawalService
     /// The SSP's fee is deducted from <paramref name="amountSats"/>: the destination receives
     /// <paramref name="amountSats"/> minus the fee. Leaves are swapped to denominations that sum
     /// to exactly <paramref name="amountSats"/> first, so no more than the requested amount ever
-    /// leaves the wallet.
+    /// leaves the wallet. To send everything use <see cref="WithdrawAllAsync"/>.
     /// </para>
     /// <para>
     /// Before anything is signed the SSP's response is verified: the exit transaction must hash
@@ -66,8 +77,7 @@ public static class WithdrawalService
     /// The exit speaks the protocol the coordinator requires today: the connector-input refund
     /// transactions are FROST-signed by the user and sent together with the encrypted key-tweak
     /// package in a single <c>cooperative_exit_v2</c> call, as the reference SDK's
-    /// <c>CoopExitService</c> does. The older two-step form (unsigned jobs, then
-    /// <c>finalize_transfer_with_transfer_package</c>) is rejected by mainnet.
+    /// <c>CoopExitService</c> does.
     /// </para>
     /// </remarks>
     /// <param name="wallet">The Spark wallet.</param>
@@ -94,10 +104,8 @@ public static class WithdrawalService
             throw new ArgumentOutOfRangeException(nameof(amountSats), amountSats, "Withdrawal amount must be positive.");
         }
 
-        var network = wallet.Client.Options.Network;
-
         // Fail fast on a malformed or wrong-network destination, before any leaf is moved.
-        _ = CoopExitValidator.ScriptPubKeyFor(onChainAddress, network);
+        _ = CoopExitValidator.ScriptPubKeyFor(onChainAddress, wallet.Options.Network);
 
         // Select leaves that sum to exactly the requested amount (swapping via the SSP if
         // needed): the SSP exits the full value of the leaves it is given.
@@ -114,9 +122,124 @@ public static class WithdrawalService
             selectedLeaves.Select(l => l.Id).ToArray(), onChainAddress, ct).ConfigureAwait(false);
         var feeCap = CoopExitValidator.ResolveFeeCap(quote.FeeSats, maxFeeSats, amountSats);
 
-        return await PerformCooperativeExitAsync(
+        var exit = await PerformCooperativeExitAsync(
             wallet, selectedLeaves, amountSats, feeCap, onChainAddress, ct).ConfigureAwait(false);
+        return exit.Txid;
     }
+
+    /// <summary>
+    /// Everything <see cref="WithdrawAllAsync"/> would do, without doing it: claims pending
+    /// inbound transfers, renews renewable leaves, and quotes the SSP fee for every spendable
+    /// leaf. Use it to show the user what will move, what it costs, and what stays behind
+    /// (<see cref="WithdrawAllQuote.FrozenSats"/>, <see cref="WithdrawAllQuote.UnrenewedSats"/>).
+    /// </summary>
+    public static async Task<WithdrawAllQuote> QuoteWithdrawAllAsync(
+        this SparkWallet wallet,
+        string onChainAddress,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(wallet);
+        var plan = await DrainPlanAsync(wallet, onChainAddress, ct).ConfigureAwait(false);
+        return new WithdrawAllQuote(
+            SpendableSats: plan.SpendableSats,
+            QuotedFeeSats: plan.QuotedFeeSats,
+            FrozenSats: plan.Balance.Frozen,
+            UnrenewedSats: plan.UnrenewedSats,
+            LockedSats: plan.Balance.Locked,
+            IncomingSats: plan.Balance.Incoming,
+            LeafCount: plan.Leaves.Count);
+    }
+
+    /// <summary>
+    /// Send every spendable sat to <paramref name="onChainAddress"/> in one cooperative exit.
+    /// </summary>
+    /// <remarks>
+    /// Pending inbound transfers are claimed first and renewable leaves renewed, then every
+    /// spendable leaf is exited; the SSP's fee comes out of that amount. Frozen leaves (refund
+    /// timelock below 100) cannot be included and are reported in the result as
+    /// <see cref="WithdrawAllResult.FrozenSats"/>; leaves whose renewal failed as
+    /// <see cref="WithdrawAllResult.UnrenewedSats"/>, sats locked by in-flight operations as
+    /// <see cref="WithdrawAllResult.LockedSats"/> and inbound sats that could not be claimed as
+    /// <see cref="WithdrawAllResult.UnclaimedSats"/>. The same response verification and fee bound
+    /// as <see cref="WithdrawAsync"/> apply.
+    /// </remarks>
+    /// <param name="wallet">The Spark wallet.</param>
+    /// <param name="onChainAddress">Destination Bitcoin address on the wallet's network.</param>
+    /// <param name="maxFeeSats">Highest fee the caller accepts; <c>null</c> uses the SSP's own quote.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <exception cref="SparkWithdrawalException">Nothing is spendable.</exception>
+    /// <exception cref="FeeExceedsLimitException">The fee would consume the whole balance or exceed the cap.</exception>
+    public static async Task<WithdrawAllResult> WithdrawAllAsync(
+        this SparkWallet wallet,
+        string onChainAddress,
+        long? maxFeeSats = null,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(wallet);
+        var plan = await DrainPlanAsync(wallet, onChainAddress, ct).ConfigureAwait(false);
+        if (plan.SpendableSats <= 0)
+        {
+            throw new SparkWithdrawalException(Operation, "Nothing is spendable: need at least 1 sat, have 0.");
+        }
+
+        var feeCap = CoopExitValidator.ResolveFeeCap(plan.QuotedFeeSats, maxFeeSats, plan.SpendableSats);
+        var exit = await PerformCooperativeExitAsync(
+            wallet, plan.Leaves, plan.SpendableSats, feeCap, onChainAddress, ct).ConfigureAwait(false);
+        return new WithdrawAllResult(
+            Txid: exit.Txid,
+            SentSats: plan.SpendableSats,
+            PayoutSats: exit.PayoutSats,
+            FrozenSats: plan.Balance.Frozen,
+            UnrenewedSats: plan.UnrenewedSats,
+            LockedSats: plan.Balance.Locked,
+            UnclaimedSats: plan.Balance.Incoming);
+    }
+
+    /// <param name="Leaves">Every spendable leaf.</param>
+    /// <param name="Balance">The balance after the claim and renewal pass.</param>
+    /// <param name="SpendableSats">Sum of <paramref name="Leaves"/>.</param>
+    /// <param name="QuotedFeeSats">The SSP's quote for exiting them.</param>
+    private sealed record DrainPlan(IReadOnlyList<SparkLeaf> Leaves, SatsBalance Balance, long SpendableSats, long QuotedFeeSats)
+    {
+        /// <summary>
+        /// Available sats that are not spendable after the renewal pass: leaves at 100…199 the
+        /// operators did not renew.
+        /// </summary>
+        public long UnrenewedSats => Math.Max(0, Balance.Available - SpendableSats);
+    }
+
+    /// <summary>
+    /// Shared prelude of <see cref="QuoteWithdrawAllAsync"/> and <see cref="WithdrawAllAsync"/>:
+    /// validate the destination, claim what is pending, renew what the coordinator will renew,
+    /// and quote the fee for the rest.
+    /// </summary>
+    private static async Task<DrainPlan> DrainPlanAsync(SparkWallet wallet, string onChainAddress, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(onChainAddress);
+        _ = CoopExitValidator.ScriptPubKeyFor(onChainAddress, wallet.Options.Network);
+        try
+        {
+            _ = await wallet.ClaimPendingTransfersAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Best effort: unclaimed sats are reported as such.
+        }
+
+        var leaves = await wallet.GetSpendableLeavesAsync(ct).ConfigureAwait(false);
+        var balance = (await wallet.GetBalanceAsync(ct).ConfigureAwait(false)).SatsBalance;
+        var spendable = leaves.Sum(l => l.ValueSats);
+        long quotedFee = 0;
+        if (spendable > 0)
+        {
+            quotedFee = (await wallet.GetFeeQuoteAsync(leaves.Select(l => l.Id).ToArray(), onChainAddress, ct).ConfigureAwait(false)).FeeSats;
+        }
+
+        return new DrainPlan(leaves, balance, spendable, quotedFee);
+    }
+
+    /// <summary>A completed cooperative exit.</summary>
+    private sealed record CooperativeExit(string Txid, long PayoutSats);
 
     /// <summary>
     /// The cooperative exit proper: request the exit from the SSP, verify what it built, sign
@@ -124,7 +247,7 @@ public static class WithdrawalService
     /// SSP. <paramref name="selectedLeaves"/> must sum to <paramref name="amountSats"/>; the
     /// payout must be at least <c>amountSats - feeCap</c>.
     /// </summary>
-    private static async Task<string> PerformCooperativeExitAsync(
+    private static async Task<CooperativeExit> PerformCooperativeExitAsync(
         SparkWallet wallet,
         IReadOnlyList<SparkLeaf> selectedLeaves,
         long amountSats,
@@ -132,14 +255,13 @@ public static class WithdrawalService
         string onChainAddress,
         CancellationToken ct)
     {
-        var options = wallet.Client.Options;
-        var coordinatorAddress = options.SigningOperatorAddresses[0];
-        var coordinatorClient = wallet.Pool.GetSparkClient(coordinatorAddress);
-        var headers = await wallet.GetAuthMetadataAsync(coordinatorAddress, ct).ConfigureAwait(false);
+        var options = wallet.Options;
+        var coordinatorClient = wallet.GetCoordinatorClient();
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
         var networkStr = FrostSigningHelper.GetNetworkString(options.Network);
         var leafIds = selectedLeaves.Select(l => l.Id).ToArray();
         var minimumPayoutSats = amountSats - feeCap;
-        var receiverPubKey = Convert.FromHexString(options.SspIdentityPublicKeyHex);
+        var receiverPubKey = options.RequireSspIdentityPublicKey();
 
         // Step 1: ask the SSP to build the exit and connector transactions.
         var transferId = Guid.NewGuid().ToString("D");
@@ -154,7 +276,8 @@ public static class WithdrawalService
                 ["user_outbound_transfer_external_id"] = transferId,
             },
             ct).ConfigureAwait(false);
-        var request = sspResponse.RequestCoopExit.Request;
+        var request = sspResponse.RequestCoopExit?.Request
+            ?? throw new SparkUntrustedResponseException(Operation, "The SSP returned no cooperative exit request.");
 
         // Step 2: verify what the SSP built before signing anything.
         var validated = CoopExitValidator.Validate(
@@ -166,6 +289,7 @@ public static class WithdrawalService
             selectedLeaves.Count,
             options.Network);
         var connectorTxBytes = Convert.FromHexString(request.RawConnectorTransaction.Trim());
+        var connectorTx = RawTransaction.Parse(connectorTxBytes, "connector tx");
 
         // Step 3: operator nonce commitments, three per leaf (cpfp, direct, directFromCpfp),
         // laid out leaf-major like the transfer flow.
@@ -184,17 +308,14 @@ public static class WithdrawalService
         var cpfpJobs = new List<UserSignedTxSigningJob>(selectedLeaves.Count);
         var directJobs = new List<UserSignedTxSigningJob>(selectedLeaves.Count);
         var directFromCpfpJobs = new List<UserSignedTxSigningJob>(selectedLeaves.Count);
-        for (int i = 0; i < selectedLeaves.Count; i++)
+        for (var i = 0; i < selectedLeaves.Count; i++)
         {
             var leaf = selectedLeaves[i];
             var verifyingKey = leaf.Node.VerifyingPublicKey.ToByteArray();
-            var connectorOutput = validated.ConnectorTx.Outputs[i];
             var refunds = BuildConnectorRefunds(
                 leaf.Node,
                 receiverPubKey,
-                validated.ConnectorTxidInternal,
-                connectorOutput.ScriptPubKey.ToBytes(),
-                (ulong)connectorOutput.Value.Satoshi,
+                connectorTx,
                 (uint)i,
                 networkStr);
 
@@ -221,6 +342,7 @@ public static class WithdrawalService
         var soListResponse = await coordinatorClient.get_signing_operator_listAsync(
             new Google.Protobuf.WellKnownTypes.Empty(), headers, cancellationToken: ct).ConfigureAwait(false);
         var soTargets = FrostSigningHelper.BuildSoTargets(soListResponse.SigningOperators, options.SigningOperators);
+        FrostSigningHelper.ValidateThreshold(options.EffectiveSigningThreshold, soTargets.Count);
         var leafDescriptors = selectedLeaves
             .Select(l => new SendTweakLeafDescriptor(l.Id, receiverPubKey))
             .ToList();
@@ -242,9 +364,8 @@ public static class WithdrawalService
             transferPackage.KeyTweakPackage.Add(soId, cipher);
         }
 
-        var transferIdBytes = Convert.FromHexString(transferId.Replace("-", "", StringComparison.Ordinal));
         var packageHash = SparkTaggedHash.Create("spark", "transfer", "signing payload")
-            .AddBytes(transferIdBytes)
+            .AddBytes(ClaimService.TransferIdBytes(transferId))
             .AddMapStringToBytes(keyTweakPackage)
             .Hash();
         transferPackage.UserSignature = ByteString.CopyFrom(
@@ -288,7 +409,7 @@ public static class WithdrawalService
             },
             ct).ConfigureAwait(false);
 
-        return validated.ExitTxidHex;
+        return new CooperativeExit(validated.ExitTxidHex, TransferMapping.ReportedSats(validated.PayoutSats));
     }
 
     // ── Connector refunds ──
@@ -311,45 +432,30 @@ public static class WithdrawalService
     internal static ConnectorRefunds BuildConnectorRefunds(
         TreeNode node,
         byte[] receiverPubKey,
-        byte[] connectorTxidInternal,
-        byte[] connectorOutputScript,
-        ulong connectorOutputValue,
+        RawTransaction connectorTx,
         uint connectorVout,
         string networkStr)
     {
-        var refundTxBytes = node.RefundTx.Length > 0
-            ? node.RefundTx.ToByteArray()
-            : node.NodeTx.ToByteArray();
         var (cpfpSequence, directSequence) = TimelockHelper.ComputeNextSequences(
-            refundTxBytes, Operation, node.Id);
+            node.RefundTx.ToByteArray(), Operation, node.Id);
+        var directNodeTx = TimelockHelper.DirectNodeTxForRefund(node);
 
-        var cpfpNodeTx = node.NodeTx.ToByteArray();
-        var isZeroNode = IsZeroTimelockNode(cpfpNodeTx);
-        var directNodeTx = node.DirectTx.Length == 0 || isZeroNode ? null : node.DirectTx.ToByteArray();
+        // The SSP validates all three refund outputs on coop-exit and rejects with
+        // "expected value X on output 0" if the standard fee isn't deducted.
+        var trio = TimelockHelper.LeafRefundTrio(node, receiverPubKey, networkStr, cpfpSequence, directSequence);
 
-        var trio = SparkTxBuilder.BuildRefundTxTrio(
-            cpfpNodeTx: cpfpNodeTx,
-            directNodeTx: directNodeTx,
-            vout: 0,
-            receivingPublicKey: receiverPubKey,
-            network: networkStr,
-            sequence: cpfpSequence,
-            directSequence: directSequence,
-            // The SSP validates all three refund outputs on coop-exit and rejects with
-            // "expected value X on output 0" if the standard fee isn't deducted.
-            feeSats: SparkConstants.DefaultRefundFeeSats);
+        var connectorOutput = connectorTx.OutputAt(connectorVout);
+        var connectorTxid = connectorTx.Txid;
+        var nodeOutput = RawTransaction.Parse(node.NodeTx.Span, "node tx").OutputAt(0);
 
-        var connectorInput = MakeConnectorInputBytes(connectorTxidInternal, connectorVout);
-        var nodeOutput = ParseTxOutput(cpfpNodeTx, 0);
-
-        ConnectorRefund WithConnector(byte[] refundTx, (byte[] Script, ulong Value) spending)
+        ConnectorRefund WithConnector(byte[] refundTx, RawTransaction.Output spending)
         {
-            var tx = AddInputToRawTx(refundTx, connectorInput);
+            var tx = AddInputToRawTx(refundTx, new RawTransaction.Input(connectorTxid, connectorVout));
             var sighash = SparkTxBuilder.ComputeMultiInputSighash(
                 tx: tx,
                 inputIndex: 0,
-                prevOutScripts: [spending.Script, connectorOutputScript],
-                prevOutValues: [spending.Value, connectorOutputValue]);
+                prevOutScripts: [spending.ScriptPubKey, connectorOutput.ScriptPubKey],
+                prevOutValues: [spending.Value, connectorOutput.Value]);
             return new ConnectorRefund(tx, sighash);
         }
 
@@ -357,278 +463,35 @@ public static class WithdrawalService
         ConnectorRefund? direct = null;
         if (trio.DirectRefund is { } directRefund && directNodeTx is not null)
         {
-            direct = WithConnector(directRefund.Tx, ParseTxOutput(directNodeTx, 0));
+            direct = WithConnector(directRefund.Tx, RawTransaction.Parse(directNodeTx, "direct node tx").OutputAt(0));
         }
         var directFromCpfp = WithConnector(trio.DirectFromCpfpRefund.Tx, nodeOutput);
         return new ConnectorRefunds(cpfp, direct, directFromCpfp);
     }
 
-    // ── Raw tx helpers ──
+    // ── Raw tx helpers (bounds-checked, see RawTransaction) ──
 
-    /// <summary>
-    /// Compute txid from raw transaction bytes (double SHA-256 of witness-stripped serialization).
-    /// Returns bytes in internal byte order (used as prevout hash in inputs).
-    /// </summary>
-    internal static byte[] ComputeTxId(byte[] rawTx)
-    {
-        var strippedTx = StripWitness(rawTx);
-        var hash1 = SHA256.HashData(strippedTx);
-        return SHA256.HashData(hash1);
-    }
+    /// <summary>Transaction id in internal byte order (the form used in input prevouts).</summary>
+    internal static byte[] ComputeTxId(byte[] rawTx) => RawTransaction.Parse(rawTx).Txid;
 
-    /// <summary>
-    /// Strip witness data from a segwit transaction to get legacy serialization for txid.
-    /// </summary>
-    internal static byte[] StripWitness(byte[] rawTx)
-    {
-        int offset = 4; // skip version
-        bool hasWitness = rawTx.Length > 5 && rawTx[offset] == 0x00 && rawTx[offset + 1] == 0x01;
-        if (!hasWitness)
-        {
-            return rawTx;
-        }
+    /// <summary>The transaction without its witness data: the serialisation its txid commits to.</summary>
+    internal static byte[] StripWitness(byte[] rawTx) => RawTransaction.Parse(rawTx).Serialize(includeWitness: false);
 
-        using var result = new MemoryStream();
-        result.Write(rawTx, 0, 4); // version
-
-        offset += 2; // skip marker + flag
-
-        // Parse inputs
-        var (inputCount, inputCountLen) = ReadVarInt(rawTx, offset);
-        int inputCountStart = offset;
-        offset += inputCountLen;
-
-        for (ulong j = 0; j < inputCount; j++)
-        {
-            offset += 36; // txid + vout
-            var (scriptLen, scriptLenLen) = ReadVarInt(rawTx, offset);
-            offset += scriptLenLen + (int)scriptLen + 4; // script + sequence
-        }
-
-        int afterInputs = offset;
-
-        // Parse outputs
-        var (outputCount, outputCountLen) = ReadVarInt(rawTx, offset);
-        offset += outputCountLen;
-        for (ulong j = 0; j < outputCount; j++)
-        {
-            offset += 8; // value
-            var (scriptLen, scriptLenLen) = ReadVarInt(rawTx, offset);
-            offset += scriptLenLen + (int)scriptLen;
-        }
-
-        int afterOutputs = offset;
-
-        // result = version + inputs + outputs + locktime
-        result.Write(rawTx, inputCountStart, afterOutputs - inputCountStart);
-        result.Write(rawTx, rawTx.Length - 4, 4); // locktime
-
-        return result.ToArray();
-    }
-
-    /// <summary>
-    /// Parse a tx output (script + value) at a given vout index.
-    /// </summary>
+    /// <summary>Parse a tx output (script + value) at a given vout.</summary>
     internal static (byte[] Script, ulong Value) ParseTxOutput(byte[] rawTx, uint vout)
     {
-        int offset = 4; // skip version
-        if (rawTx.Length > 5 && rawTx[offset] == 0x00 && rawTx[offset + 1] == 0x01)
-        {
-            offset += 2; // skip segwit marker + flag
-        }
-
-        // Skip inputs
-        var (inputCount, inputCountLen) = ReadVarInt(rawTx, offset);
-        offset += inputCountLen;
-        for (ulong j = 0; j < inputCount; j++)
-        {
-            offset += 36;
-            var (scriptLen, scriptLenLen) = ReadVarInt(rawTx, offset);
-            offset += scriptLenLen + (int)scriptLen + 4;
-        }
-
-        // Parse outputs
-        var (outputCount, outputCountLen) = ReadVarInt(rawTx, offset);
-        offset += outputCountLen;
-        if (vout >= outputCount)
-        {
-            throw new InvalidOperationException($"vout {vout} not found in transaction with {outputCount} outputs");
-        }
-
-        for (uint i = 0; i <= vout; i++)
-        {
-            ulong value = BitConverter.ToUInt64(rawTx, offset);
-            offset += 8;
-            var (scriptLen, scriptLenLen) = ReadVarInt(rawTx, offset);
-            offset += scriptLenLen;
-            var script = new byte[scriptLen];
-            Array.Copy(rawTx, offset, script, 0, (int)scriptLen);
-            offset += (int)scriptLen;
-
-            if (i == vout)
-            {
-                return (script, value);
-            }
-        }
-
-        throw new InvalidOperationException($"vout {vout} not found in transaction");
+        var output = RawTransaction.Parse(rawTx).OutputAt(vout);
+        return (output.ScriptPubKey, output.Value);
     }
 
     /// <summary>
-    /// Check if a node tx has zero timelock (sequence lower 16 bits == 0).
+    /// Append an input to a raw transaction, preserving its serialisation format. A witness
+    /// transaction gets an empty witness stack for the new input.
     /// </summary>
-    internal static bool IsZeroTimelockNode(byte[] nodeTx)
+    internal static byte[] AddInputToRawTx(byte[] rawTx, RawTransaction.Input input)
     {
-        var seq = ClaimService.ParseInputSequence(nodeTx);
-        return (seq & 0xFFFF) == 0;
-    }
-
-    /// <summary>
-    /// Create raw bytes for a connector input: txid(32) + vout(4) + empty scriptSig(1) + sequence(4).
-    /// </summary>
-    internal static byte[] MakeConnectorInputBytes(byte[] txId, uint vout)
-    {
-        var input = new byte[32 + 4 + 1 + 4]; // 41 bytes
-        // txid already in internal byte order
-        Array.Copy(txId, 0, input, 0, 32);
-        // vout LE
-        BitConverter.TryWriteBytes(input.AsSpan(32), vout);
-        // scriptSig length = 0 (already zero)
-        // sequence = 0xFFFFFFFF
-        BitConverter.TryWriteBytes(input.AsSpan(37), 0xFFFFFFFFu);
-        return input;
-    }
-
-    /// <summary>
-    /// Add an input to a raw Bitcoin transaction, bumping the input count varint and
-    /// handling witness data if present.
-    /// </summary>
-    internal static byte[] AddInputToRawTx(byte[] rawTx, byte[] input)
-    {
-        int offset = 4; // skip version
-        bool hasWitness = rawTx.Length > 5 && rawTx[offset] == 0x00 && rawTx[offset + 1] == 0x01;
-        if (hasWitness)
-        {
-            offset += 2;
-        }
-
-        // Read input count
-        var (inputCount, inputCountLen) = ReadVarInt(rawTx, offset);
-        int inputCountOffset = offset;
-        offset += inputCountLen;
-
-        // Find end of all inputs
-        for (ulong j = 0; j < inputCount; j++)
-        {
-            offset += 36; // txid + vout
-            var (scriptLen, scriptLenLen) = ReadVarInt(rawTx, offset);
-            offset += scriptLenLen + (int)scriptLen + 4; // script + sequence
-        }
-        int afterInputs = offset;
-
-        using var result = new MemoryStream();
-
-        if (hasWitness)
-        {
-            result.Write(rawTx, 0, 4); // version
-            result.Write([0x00, 0x01]); // marker + flag
-        }
-        else
-        {
-            result.Write(rawTx, 0, 4); // version
-        }
-
-        // New input count
-        var newCountBytes = EncodeVarInt(inputCount + 1);
-        result.Write(newCountBytes);
-        // Existing inputs (skip old input count bytes)
-        result.Write(rawTx, inputCountOffset + inputCountLen, afterInputs - (inputCountOffset + inputCountLen));
-        // New connector input
-        result.Write(input);
-
-        if (hasWitness)
-        {
-            // Find end of outputs
-            int outOffset = afterInputs;
-            var (outputCount, outputCountLen) = ReadVarInt(rawTx, outOffset);
-            outOffset += outputCountLen;
-            for (ulong j = 0; j < outputCount; j++)
-            {
-                outOffset += 8;
-                var (scriptLen, scriptLenLen) = ReadVarInt(rawTx, outOffset);
-                outOffset += scriptLenLen + (int)scriptLen;
-            }
-            int afterOutputs = outOffset;
-
-            // Outputs
-            result.Write(rawTx, afterInputs, afterOutputs - afterInputs);
-
-            // Existing witness data
-            for (ulong j = 0; j < inputCount; j++)
-            {
-                var (witnessCount, witnessCountLen) = ReadVarInt(rawTx, outOffset);
-                int witnessStart = outOffset;
-                outOffset += witnessCountLen;
-                for (ulong k = 0; k < witnessCount; k++)
-                {
-                    var (itemLen, itemLenLen) = ReadVarInt(rawTx, outOffset);
-                    outOffset += itemLenLen + (int)itemLen;
-                }
-                result.Write(rawTx, witnessStart, outOffset - witnessStart);
-            }
-            // Empty witness for new connector input
-            result.WriteByte(0x00);
-
-            // Locktime
-            result.Write(rawTx, rawTx.Length - 4, 4);
-        }
-        else
-        {
-            // Rest of tx (outputs + locktime)
-            result.Write(rawTx, afterInputs, rawTx.Length - afterInputs);
-        }
-
-        return result.ToArray();
-    }
-
-    internal static (ulong value, int bytesRead) ReadVarInt(byte[] data, int offset)
-    {
-        var first = data[offset];
-        return first switch
-        {
-            < 0xFD => (first, 1),
-            0xFD => (BitConverter.ToUInt16(data, offset + 1), 3),
-            0xFE => (BitConverter.ToUInt32(data, offset + 1), 5),
-            _ => (BitConverter.ToUInt64(data, offset + 1), 9),
-        };
-    }
-
-    internal static byte[] EncodeVarInt(ulong value)
-    {
-        if (value < 0xFD)
-        {
-            return [(byte)value];
-        }
-
-        if (value <= 0xFFFF)
-        {
-            var buf = new byte[3];
-            buf[0] = 0xFD;
-            BitConverter.TryWriteBytes(buf.AsSpan(1), (ushort)value);
-            return buf;
-        }
-        if (value <= 0xFFFFFFFF)
-        {
-            var buf = new byte[5];
-            buf[0] = 0xFE;
-            BitConverter.TryWriteBytes(buf.AsSpan(1), (uint)value);
-            return buf;
-        }
-        {
-            var buf = new byte[9];
-            buf[0] = 0xFF;
-            BitConverter.TryWriteBytes(buf.AsSpan(1), value);
-            return buf;
-        }
+        var tx = RawTransaction.Parse(rawTx, "refund tx");
+        tx.Inputs.Add(input);
+        return tx.Serialize(includeWitness: true);
     }
 }

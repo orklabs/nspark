@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using NBitcoin;
+using NSpark.Bitcoin;
 using NSpark.Services;
 
 namespace NSpark.UnitTests.Services;
@@ -18,7 +19,7 @@ public sealed class WithdrawalServiceTests
     {
         var tx = SampleTx(withWitness: false);
 
-        var actual = WithdrawalService.AddInputToRawTx(tx.ToBytes(), WithdrawalService.MakeConnectorInputBytes(ConnectorTxid, 2));
+        var actual = WithdrawalService.AddInputToRawTx(tx.ToBytes(), new RawTransaction.Input(ConnectorTxid, 2));
 
         var expected = tx.Clone();
         expected.Inputs.Add(new TxIn(new OutPoint(new uint256(ConnectorTxid), 2)) { Sequence = Sequence.Final });
@@ -37,7 +38,7 @@ public sealed class WithdrawalServiceTests
     {
         var tx = SampleTx(withWitness: true);
 
-        var actual = WithdrawalService.AddInputToRawTx(tx.ToBytes(), WithdrawalService.MakeConnectorInputBytes(ConnectorTxid, 0));
+        var actual = WithdrawalService.AddInputToRawTx(tx.ToBytes(), new RawTransaction.Input(ConnectorTxid, 0));
 
         var expected = tx.Clone();
         expected.Inputs.Add(new TxIn(new OutPoint(new uint256(ConnectorTxid), 0)) { Sequence = Sequence.Final });
@@ -82,8 +83,8 @@ public sealed class WithdrawalServiceTests
         var zero = SampleTx(withWitness: false, sequence: 1u << 30);
         var nonZero = SampleTx(withWitness: false, sequence: (1u << 30) | 2000);
 
-        WithdrawalService.IsZeroTimelockNode(zero.ToBytes()).Should().BeTrue();
-        WithdrawalService.IsZeroTimelockNode(nonZero.ToBytes()).Should().BeFalse();
+        TimelockHelper.IsZeroTimelockNode(zero.ToBytes()).Should().BeTrue();
+        TimelockHelper.IsZeroTimelockNode(nonZero.ToBytes()).Should().BeFalse();
     }
 
     private static Transaction SampleTx(bool withWitness, uint sequence = 0xFFFFFFFE)
