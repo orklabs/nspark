@@ -5,6 +5,8 @@ package common;
 option go_package = "github.com/lightsparkdev/spark/proto/common";
 option csharp_namespace = "NSpark.Proto.Common";
 
+import "validate/validate.proto";
+
 /*
  * A map from a string to a bytes. It's a workaround to have map arrays in proto.
  */
@@ -47,6 +49,6 @@ enum SignatureScheme {
 
 // A signature tagged with the scheme used to produce it, which determines how to verify it.
 message Signature {
-    SignatureScheme scheme = 1;
-    bytes signature = 2;
+    SignatureScheme scheme = 1 [(validate.rules).enum = {defined_only: true, not_in: [0]}];
+    bytes signature = 2 [(validate.rules).bytes.min_len = 1];
 }
