@@ -824,7 +824,7 @@ public class SwapTests
     /// </summary>
     private static NSpark.Proto.TreeNode SpendableNode()
     {
-        var tx = new byte[4 + 1 + 36 + 1 + 4];
+        var tx = new byte[4 + 1 + 36 + 1 + 4 + 1 + 4]; // version, 1 input, 0 outputs, locktime
         tx[0] = 0x02; // version
         tx[4] = 0x01; // one input; prevout, empty script
         BitConverter.GetBytes(2000u).CopyTo(tx, 42); // nSequence = initial timelock
@@ -1098,11 +1098,10 @@ public class WithdrawalTests
 
         // Build (but never sign) the connector refunds for the first leaf: proves the raw-tx helpers
         // accept the SSP's real transactions and produce the two-input sighashes the exit would sign.
-        var sspPubKey = Convert.FromHexString(_client.Options.SspIdentityPublicKeyHex);
-        var connectorOutput = validated.ConnectorTx.Outputs[0];
+        var sspPubKey = _client.Options.RequireSspIdentityPublicKey();
+        var connectorTx = NSpark.Bitcoin.RawTransaction.ParseHex(request.RawConnectorTransaction, "connector tx");
         var refunds = WithdrawalService.BuildConnectorRefunds(
-            leaves[0].Node, sspPubKey, validated.ConnectorTxidInternal,
-            connectorOutput.ScriptPubKey.ToBytes(), (ulong)connectorOutput.Value.Satoshi, 0,
+            leaves[0].Node, sspPubKey, connectorTx, 0,
             FrostSigningHelper.GetNetworkString(_client.Options.Network));
         Assert.That(refunds.Cpfp.Sighash, Has.Length.EqualTo(32));
         Assert.That(refunds.DirectFromCpfp.Sighash, Has.Length.EqualTo(32));
@@ -1114,7 +1113,9 @@ public class WithdrawalTests
     /// The real thing: spends balance on-chain. Opt in with <c>NSPARK_TEST_ALLOW_WITHDRAW=1</c>.
     /// Optional: <c>NSPARK_TEST_WITHDRAW_SATS</c> (default: every spendable sat),
     /// <c>NSPARK_TEST_WITHDRAW_DESTINATION</c> (default: this wallet's own static deposit
-    /// address, so the payout can be claimed back with <c>ClaimStaticDepositAsync</c>),
+    /// address, so the payout can be claimed back with <c>ClaimStaticDepositAsync</c>;
+    /// <c>receiver-static-deposit</c> pays wallet B's static deposit address, as the Swift
+    /// suite's option does, for B to claim with <c>NSPARK_TEST_CLAIM_STATIC=B</c>),
     /// <c>NSPARK_TEST_WITHDRAW_MAX_FEE_SATS</c> (default: the SSP's quote).
     /// </summary>
     [Test, Explicit("Destructive: spends balance on-chain; set NSPARK_TEST_ALLOW_WITHDRAW=1")]
@@ -1129,8 +1130,12 @@ public class WithdrawalTests
             return;
         }
 
-        var destination = TestSecrets.TryGet("NSPARK_TEST_WITHDRAW_DESTINATION")
-            ?? (await _wallet.GetStaticDepositAddressAsync(cts.Token)).Address;
+        var destination = TestSecrets.TryGet("NSPARK_TEST_WITHDRAW_DESTINATION") switch
+        {
+            null => (await _wallet.GetStaticDepositAddressAsync(cts.Token)).Address,
+            "receiver-static-deposit" => (await (await _client.CreateWalletAsync(TestSecrets.MnemonicB)).GetStaticDepositAddressAsync(cts.Token)).Address,
+            var explicitAddress => explicitAddress,
+        };
         var spendable = await _wallet.GetSpendableLeavesAsync(cts.Token);
         var amount = long.TryParse(TestSecrets.TryGet("NSPARK_TEST_WITHDRAW_SATS"), out var configuredAmount)
             ? configuredAmount
@@ -1390,6 +1395,16 @@ public class DebugTests
         TestContext.Out.WriteLine($"  Identity: {walletB.IdentityPublicKeyHex}");
         TestContext.Out.WriteLine($"  Spark:    {walletB.GetSparkAddress()}");
         TestContext.Out.WriteLine($"  Balance:  {balB.SatsBalance.Available} sats ({balB.Leaves.Count} leaves)");
+
+        foreach (var (label, wallet, balance) in new[] { ("A", walletA, balA), ("B", walletB, balB) })
+        {
+            var staticAddress = (await wallet.GetStaticDepositAddressAsync(cts.Token)).Address;
+            var unclaimed = await wallet.GetUtxosForDepositAddressAsync(staticAddress, ct: cts.Token);
+            TestContext.Out.WriteLine(
+                $"[{label}] owned {balance.SatsBalance.Owned}, frozen {balance.SatsBalance.Frozen}, incoming {balance.SatsBalance.Incoming}; " +
+                $"static deposit address {staticAddress} with {unclaimed.Count} unclaimed utxo(s)" +
+                string.Concat(unclaimed.Select(u => $" {u.Txid}:{u.Vout}")));
+        }
     }
 }
 

@@ -172,6 +172,7 @@ public class TokenLifecycleTests
         UInt128 mintAmount = 10_000;
         var mintTx = await _walletA.MintTokensAsync(tokenIdentifier, mintAmount, cts.Token);
         Assert.That(mintTx.TransactionHash, Is.Not.Empty);
+        await ExpectOperatorsKnowAsync(mintTx.TransactionHash, _walletA, 3, cts.Token);
         TestContext.Out.WriteLine($"Mint tx: {mintTx.TransactionHash}");
         await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
 
@@ -194,6 +195,7 @@ public class TokenLifecycleTests
         var transferTx = await _walletA.TransferTokensAsync(
             tokenIdentifier, transferAmount, sparkAddressB, ct: cts.Token);
         Assert.That(transferTx.TransactionHash, Is.Not.Empty);
+        await ExpectOperatorsKnowAsync(transferTx.TransactionHash, _walletA, 3, cts.Token);
         TestContext.Out.WriteLine($"Transfer A->B tx: {transferTx.TransactionHash}");
         await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
 
@@ -213,6 +215,7 @@ public class TokenLifecycleTests
         var returnTx = await _walletB.TransferTokensAsync(
             tokenIdentifier, transferAmount, sparkAddressA, ct: cts.Token);
         Assert.That(returnTx.TransactionHash, Is.Not.Empty);
+        await ExpectOperatorsKnowAsync(returnTx.TransactionHash, _walletB, 3, cts.Token);
         TestContext.Out.WriteLine($"Transfer B->A tx: {returnTx.TransactionHash}");
         await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
 
@@ -235,6 +238,7 @@ public class TokenLifecycleTests
         UInt128 burnAmount = 1_000;
         var burnTx = await _walletA.BurnTokensAsync(tokenIdentifier, burnAmount, ct: cts.Token);
         Assert.That(burnTx.TransactionHash, Is.Not.Empty);
+        await ExpectOperatorsKnowAsync(burnTx.TransactionHash, _walletA, 3, cts.Token);
         TestContext.Out.WriteLine($"Burn tx: {burnTx.TransactionHash}");
         await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
 
@@ -244,6 +248,135 @@ public class TokenLifecycleTests
             $"WalletA NSPK balance after burn: {afterBurnForToken?.OwnedBalance ?? UInt128.Zero}");
 
         TestContext.Out.WriteLine("\nFull token lifecycle complete.");
+    }
+
+    /// <summary>
+    /// The operators hold a finalized transaction of <paramref name="version"/> under
+    /// <paramref name="hash"/>, the hash the SDK reported for it.
+    /// </summary>
+    private static async Task ExpectOperatorsKnowAsync(string hash, SparkWallet wallet, uint version, CancellationToken ct)
+    {
+        var request = new NSpark.Proto.Token.QueryTokenTransactionsRequest
+        {
+            ByTxHash = new NSpark.Proto.Token.QueryTokenTransactionsByTxHash(),
+        };
+        request.ByTxHash.TokenTransactionHashes.Add(Google.Protobuf.ByteString.CopyFrom(Convert.FromHexString(hash)));
+        var response = await wallet.GetTokenClient(wallet.CoordinatorAddress).query_token_transactionsAsync(
+            request, await wallet.GetCoordinatorAuthMetadataAsync(ct), cancellationToken: ct);
+        var found = response.TokenTransactionsWithStatus;
+        Assert.That(found.Select(t => Convert.ToHexString(t.TokenTransactionHash.Span).ToLowerInvariant()), Is.EqualTo(new[] { hash }),
+            $"the operators hold no transaction {hash}");
+        Assert.That(found[0].Status, Is.EqualTo(NSpark.Proto.Token.TokenTransactionStatus.TokenTransactionFinalized));
+        Assert.That(found[0].TokenTransaction.Version, Is.EqualTo(version));
+    }
+
+    private async Task<string> IssuedTokenAsync(CancellationToken ct)
+    {
+        var issued = await _walletA.QueryTokenMetadataAsync(issuerPublicKeys: [_walletA.IdentityPublicKey], ct: ct);
+        if (issued.Count == 0)
+        {
+            Assert.Inconclusive("Wallet A has issued no token; the lifecycle test creates one.");
+        }
+
+        return issued[0].TokenIdentifier;
+    }
+
+    private static async Task<UInt128> TokenBalanceAsync(SparkWallet wallet, string token, CancellationToken ct) =>
+        (await wallet.GetTokenBalancesAsync(ct)).FirstOrDefault(b => b.TokenMetadata.TokenIdentifier == token)?.OwnedBalance ?? UInt128.Zero;
+
+    [Test]
+    public async Task Two_concurrent_sends_from_one_wallet_both_land_on_different_outputs()
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CurrentContext.CancellationToken);
+        cts.CancelAfter(Timeout);
+        var ct = cts.Token;
+        var token = await IssuedTokenAsync(ct);
+        var available = (await _walletA.GetTokenOutputsAsync(token, ct)).Where(o => o.Status == "AVAILABLE").ToList();
+        if (available.Count < 2)
+        {
+            for (var i = available.Count; i < 2; i++)
+            {
+                await _walletA.MintTokensAsync(token, 10, ct);
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            available = (await _walletA.GetTokenOutputsAsync(token, ct)).Where(o => o.Status == "AVAILABLE").ToList();
+        }
+
+        // The smallest output's amount: each send then spends a single output, and without locks
+        // both would pick the same one and the operators would refuse one as pre-empted.
+        var amount = available.Min(o => o.TokenAmount);
+        var before = await TokenBalanceAsync(_walletB, token, ct);
+
+        var addressB = _walletB.GetSparkAddress();
+        var hashes = await Task.WhenAll(
+            _walletA.TransferTokensAsync(token, amount, addressB, ct: ct),
+            _walletA.TransferTokensAsync(token, amount, addressB, ct: ct));
+        TestContext.Out.WriteLine($"Concurrent sends of {amount}: {string.Join(", ", hashes.Select(h => h.TransactionHash))}");
+        Assert.That(hashes.Select(h => h.TransactionHash).Distinct().Count(), Is.EqualTo(2));
+        foreach (var hash in hashes)
+        {
+            await ExpectOperatorsKnowAsync(hash.TransactionHash, _walletA, 3, ct);
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        Assert.That(await TokenBalanceAsync(_walletB, token, ct), Is.EqualTo(before + (2 * amount)));
+
+        // Back to A.
+        await _walletB.TransferTokensAsync(token, 2 * amount, _walletA.GetSparkAddress(), ct: ct);
+        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        Assert.That(await TokenBalanceAsync(_walletB, token, ct), Is.EqualTo(before));
+    }
+
+    [Test]
+    public async Task A_send_retried_with_its_idempotency_key_is_made_once_and_returns_the_same_hash()
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CurrentContext.CancellationToken);
+        cts.CancelAfter(Timeout);
+        var ct = cts.Token;
+        var token = await IssuedTokenAsync(ct);
+        var before = await TokenBalanceAsync(_walletB, token, ct);
+
+        var key = Guid.NewGuid().ToString();
+        var addressB = _walletB.GetSparkAddress();
+        var first = await _walletA.TransferTokensAsync(token, 7, addressB, idempotencyKey: key, ct: ct);
+        var retry = await _walletA.TransferTokensAsync(token, 7, addressB, idempotencyKey: key, ct: ct);
+        TestContext.Out.WriteLine($"Keyed send: {first.TransactionHash}, retried: {retry.TransactionHash}");
+        Assert.That(retry.TransactionHash, Is.EqualTo(first.TransactionHash));
+        await ExpectOperatorsKnowAsync(first.TransactionHash, _walletA, 3, ct);
+
+        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        Assert.That(await TokenBalanceAsync(_walletB, token, ct), Is.EqualTo(before + 7));
+
+        // Back to A.
+        await _walletB.TransferTokensAsync(token, 7, _walletA.GetSparkAddress(), ct: ct);
+        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        Assert.That(await TokenBalanceAsync(_walletB, token, ct), Is.EqualTo(before));
+    }
+
+    [Test]
+    public async Task V2_token_transactions_still_work_when_configured()
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CurrentContext.CancellationToken);
+        cts.CancelAfter(Timeout);
+        var ct = cts.Token;
+        var token = await IssuedTokenAsync(ct);
+        using var v2Client = new SparkConnection(
+            Options.Create(new SparkOptions { Network = SparkNetwork.Mainnet, TokenTransactionVersion = TokenTransactionVersion.V2 }),
+            new HttpClient());
+        var walletAv2 = await v2Client.CreateWalletAsync(MnemonicA, ct: ct);
+        var before = await TokenBalanceAsync(_walletB, token, ct);
+
+        var hash = await walletAv2.TransferTokensAsync(token, 3, _walletB.GetSparkAddress(), ct: ct);
+        TestContext.Out.WriteLine($"V2 send: {hash.TransactionHash}");
+        await ExpectOperatorsKnowAsync(hash.TransactionHash, walletAv2, 2, ct);
+        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        Assert.That(await TokenBalanceAsync(_walletB, token, ct), Is.EqualTo(before + 3));
+
+        // Back to A, as V3.
+        await _walletB.TransferTokensAsync(token, 3, _walletA.GetSparkAddress(), ct: ct);
+        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        Assert.That(await TokenBalanceAsync(_walletB, token, ct), Is.EqualTo(before));
     }
 
     [Test]

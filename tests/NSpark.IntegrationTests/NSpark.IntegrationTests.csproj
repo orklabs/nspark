@@ -26,20 +26,25 @@
     <Using Include="NUnit.Framework" />
   </ItemGroup>
 
-  <!-- Copy spark_frost native library to output root so DllImport can find it during tests. -->
+  <!-- Copy the spark_frost native library to the output root so P/Invoke finds it during tests:
+       a project reference does not list runtimes/{rid}/native assets in the deps file. -->
+  <PropertyGroup>
+    <SparkFrostArch>$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</SparkFrostArch>
+    <SparkFrostRuntimes>..\..\src\NSpark\runtimes</SparkFrostRuntimes>
+  </PropertyGroup>
   <ItemGroup>
-    <None Include="..\..\src\NSpark\runtimes\osx-arm64\native\libspark_frost.dylib"
+    <None Include="$(SparkFrostRuntimes)\osx-$(SparkFrostArch)\native\libspark_frost.dylib"
           CopyToOutputDirectory="PreserveNewest"
           Link="libspark_frost.dylib"
-          Condition="$([MSBuild]::IsOSPlatform('osx')) and Exists('..\..\src\NSpark\runtimes\osx-arm64\native\libspark_frost.dylib')" />
-    <None Include="..\..\src\NSpark\runtimes\linux-x64\native\libspark_frost.so"
+          Condition="$([MSBuild]::IsOSPlatform('osx')) and Exists('$(SparkFrostRuntimes)\osx-$(SparkFrostArch)\native\libspark_frost.dylib')" />
+    <None Include="$(SparkFrostRuntimes)\linux-$(SparkFrostArch)\native\libspark_frost.so"
           CopyToOutputDirectory="PreserveNewest"
           Link="libspark_frost.so"
-          Condition="$([MSBuild]::IsOSPlatform('linux')) and Exists('..\..\src\NSpark\runtimes\linux-x64\native\libspark_frost.so')" />
-    <None Include="..\..\src\NSpark\runtimes\win-x64\native\spark_frost.dll"
+          Condition="$([MSBuild]::IsOSPlatform('linux')) and Exists('$(SparkFrostRuntimes)\linux-$(SparkFrostArch)\native\libspark_frost.so')" />
+    <None Include="$(SparkFrostRuntimes)\win-$(SparkFrostArch)\native\spark_frost.dll"
           CopyToOutputDirectory="PreserveNewest"
           Link="spark_frost.dll"
-          Condition="$([MSBuild]::IsOSPlatform('windows')) and Exists('..\..\src\NSpark\runtimes\win-x64\native\spark_frost.dll')" />
+          Condition="$([MSBuild]::IsOSPlatform('windows')) and Exists('$(SparkFrostRuntimes)\win-$(SparkFrostArch)\native\spark_frost.dll')" />
   </ItemGroup>
 
 </Project>
