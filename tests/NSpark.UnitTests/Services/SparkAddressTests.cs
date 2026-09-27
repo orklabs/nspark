@@ -2,6 +2,7 @@ using Google.Protobuf;
 using NSpark.Exceptions;
 using NSpark.Proto;
 using NSpark.Services;
+using NSpark.UnitTests.TestSupport;
 using SparkAddress = NSpark.Services.SparkAddress;
 
 namespace NSpark.UnitTests.Services;
@@ -143,5 +144,25 @@ public sealed class SparkAddressTests
         // No identity key at all.
         var noKey = () => SparkAddress.Decode(Address([0x78, 0x01]), SparkNetwork.Mainnet);
         noKey.Should().Throw<SparkConfigurationException>();
+    }
+
+    [Test]
+    [CancelAfter(60_000)]
+    public async Task Sending_sats_or_tokens_to_a_Spark_invoice_is_refused_before_any_network_call(CancellationToken ct)
+    {
+        var state = FakeOperatorState.Accepting();
+
+        await FakeOperator.RunAsync(state, async wallet =>
+        {
+            var invoice = SatsInvoice(Convert.FromHexString(VectorIdentity), 10, SparkNetwork.Regtest);
+            var send = () => wallet.SendAsync(invoice, 10L, ct);
+            await send.Should().ThrowAsync<SparkConfigurationException>();
+
+            var token = TokenIdentifier.Encode(Enumerable.Repeat((byte)0x42, 32).ToArray(), SparkNetwork.Regtest);
+            var transfer = () => wallet.TransferTokensAsync(token, 10, invoice, ct: ct);
+            await transfer.Should().ThrowAsync<SparkConfigurationException>();
+        });
+
+        state.Methods.Should().BeEmpty();
     }
 }

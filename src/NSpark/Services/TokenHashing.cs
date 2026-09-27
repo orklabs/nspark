@@ -102,18 +102,47 @@ internal static class TokenHashing
             allHashes.Add(SHA256.HashData(UInt64BigEndian(expirySecs)));
         }
 
-        // Invoice attachments, sorted by raw invoice string.
-        var invoices = tx.InvoiceAttachments
-            .OrderBy(a => a.SparkInvoice, StringComparer.Ordinal)
+        // Invoice attachments (V2): each raw invoice string, ordered by the invoice's id (its 16
+        // UUID bytes) as the operators and the reference SDK order them.
+        var attachments = tx.InvoiceAttachments;
+        allHashes.Add(SHA256.HashData(UInt32BigEndian((uint)attachments.Count)));
+        var keyed = attachments
+            .Select((attachment, index) => (Id: SparkInvoiceId(attachment.SparkInvoice, index), Raw: attachment.SparkInvoice))
+            .OrderBy(a => a.Id, ByteArrayLexicographicComparer.Instance)
             .ToList();
-        allHashes.Add(SHA256.HashData(UInt32BigEndian((uint)invoices.Count)));
-        foreach (var inv in invoices)
+        foreach (var attachment in keyed)
         {
-            allHashes.Add(SHA256.HashData(Encoding.UTF8.GetBytes(inv.SparkInvoice)));
+            allHashes.Add(SHA256.HashData(Encoding.UTF8.GetBytes(attachment.Raw)));
         }
 
         // Final SHA-256 over the concatenation.
         return SHA256.HashData(Concat(allHashes));
+    }
+
+    /// <summary>
+    /// The id of the Spark invoice in invoice attachment <paramref name="index"/>: the 16 UUID
+    /// bytes of its <c>SparkInvoiceFields.id</c>. On any network: the hash does not check it, as
+    /// the operators' and the reference SDK's do not.
+    /// </summary>
+    /// <exception cref="SparkConfigurationException">The attachment is not a Spark invoice with a 16-byte id.</exception>
+    internal static byte[] SparkInvoiceId(string invoice, int index)
+    {
+        try
+        {
+            var (_, payload) = Bech32mHelper.Decode(invoice, limit: 1024);
+            var address = NSpark.Proto.SparkAddress.Parser.ParseFrom(payload);
+            if (address.SparkInvoiceFields is { Id.Length: 16 } fields)
+            {
+                return fields.Id.ToByteArray();
+            }
+        }
+        catch (Exception ex) when (ex is SparkConfigurationException or Google.Protobuf.InvalidProtocolBufferException or ArgumentException)
+        {
+            // Refused below.
+        }
+
+        throw new SparkConfigurationException(
+            "token.hash", $"Invoice attachment {index} is not a Spark invoice with a 16-byte id.");
     }
 
     /// <summary>

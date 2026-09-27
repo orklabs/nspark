@@ -52,7 +52,10 @@ internal static class TokenTransactionValidator
         {
             throw Fail("invoice attachments changed");
         }
-        if (!final.ClientCreatedTimestamp.Equals(partial.ClientCreatedTimestamp))
+        // To the millisecond, the precision the transaction hash covers.
+        if (final.ClientCreatedTimestamp is null
+            || partial.ClientCreatedTimestamp is null
+            || Milliseconds(final.ClientCreatedTimestamp) != Milliseconds(partial.ClientCreatedTimestamp))
         {
             throw Fail("client created timestamp changed");
         }
@@ -205,6 +208,85 @@ internal static class TokenTransactionValidator
             }
         }
     }
+
+    /// <summary>
+    /// Checks that the final transaction the coordinator answers <c>broadcast_transaction</c> with
+    /// is the V3 partial transaction the wallet signed, plus only what the operators add: a
+    /// revocation commitment per output, and a create's creation entity key. The wallet signs only
+    /// the partial transaction, whose hash already binds the inputs, outputs and amounts; this
+    /// makes sure the hash the SDK reports is of that transaction. Fields are compared by their
+    /// protohash, which is what the transaction's hash covers.
+    /// </summary>
+    internal static void ValidateV3(FinalTokenTransaction final, PartialTokenTransaction partial)
+    {
+        ArgumentNullException.ThrowIfNull(final);
+        ArgumentNullException.ThrowIfNull(partial);
+
+        static bool Same(Google.Protobuf.IMessage lhs, Google.Protobuf.IMessage rhs) =>
+            ProtoHash.Hash(lhs).AsSpan().SequenceEqual(ProtoHash.Hash(rhs));
+
+        if (final.Version != partial.Version)
+        {
+            throw Fail("version changed");
+        }
+        if (final.TokenTransactionMetadata is null
+            || partial.TokenTransactionMetadata is null
+            || !Same(final.TokenTransactionMetadata, partial.TokenTransactionMetadata))
+        {
+            throw Fail("metadata changed");
+        }
+        if (!Equals(final.ExecuteBefore, partial.ExecuteBefore))
+        {
+            throw Fail("execute-before changed");
+        }
+
+        switch ((final.TokenInputsCase, partial.TokenInputsCase))
+        {
+            case (FinalTokenTransaction.TokenInputsOneofCase.TransferInput, PartialTokenTransaction.TokenInputsOneofCase.TransferInput):
+                if (!Same(final.TransferInput, partial.TransferInput))
+                {
+                    throw Fail("inputs changed");
+                }
+                break;
+            case (FinalTokenTransaction.TokenInputsOneofCase.MintInput, PartialTokenTransaction.TokenInputsOneofCase.MintInput):
+                if (!Same(final.MintInput, partial.MintInput))
+                {
+                    throw Fail("mint input changed");
+                }
+                break;
+            case (FinalTokenTransaction.TokenInputsOneofCase.CreateInput, PartialTokenTransaction.TokenInputsOneofCase.CreateInput):
+                var answered = final.CreateInput.Clone();
+                answered.ClearCreationEntityPublicKey(); // set by the operators
+                if (!Same(answered, partial.CreateInput))
+                {
+                    throw Fail("create input changed");
+                }
+                break;
+            default:
+                throw Fail("transaction type changed or missing");
+        }
+
+        if (final.FinalTokenOutputs.Count != partial.PartialTokenOutputs.Count)
+        {
+            throw Fail($"output count changed ({final.FinalTokenOutputs.Count} vs {partial.PartialTokenOutputs.Count})");
+        }
+
+        for (var i = 0; i < partial.PartialTokenOutputs.Count; i++)
+        {
+            var answered = final.FinalTokenOutputs[i];
+            if (answered.PartialTokenOutput is null || !Same(answered.PartialTokenOutput, partial.PartialTokenOutputs[i]))
+            {
+                throw Fail($"output {i} changed");
+            }
+            if (answered.RevocationCommitment.Length != 33)
+            {
+                throw Fail($"output {i} has no revocation commitment");
+            }
+        }
+    }
+
+    private static long Milliseconds(Google.Protobuf.WellKnownTypes.Timestamp timestamp) =>
+        (timestamp.Seconds * 1_000) + (timestamp.Nanos / 1_000_000);
 
     private static SparkUntrustedResponseException Fail(string what) =>
         new(Operation, $"The coordinator's final token transaction was rejected: {what}.");

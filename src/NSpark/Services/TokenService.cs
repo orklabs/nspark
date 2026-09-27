@@ -1,8 +1,10 @@
 using System.Buffers.Binary;
+using System.Text;
 using Google.Protobuf;
 using NSpark.Exceptions;
 using NSpark.Models;
 using NSpark.Proto;
+using NSpark.Proto.Multisig;
 using NSpark.Proto.Token;
 using ProtoTokenMetadata = NSpark.Proto.Token.TokenMetadata;
 using TokenMetadata = NSpark.Models.TokenMetadata;
@@ -14,28 +16,25 @@ namespace NSpark.Services;
 /// tokens (LRC-20-style fungible assets settled on Spark).
 /// </summary>
 /// <remarks>
-/// <para>
-/// <b>Read-side methods</b> (balances, outputs, metadata queries) are fully
-/// implemented and match the Swift / Kotlin / TS Spark SDKs.
-/// </para>
-/// <para>
-/// <b>Write-side methods</b> (<see cref="TransferTokensAsync"/>,
-/// <see cref="CreateTokenAsync"/>, <see cref="MintTokensAsync"/>,
-/// <see cref="BurnTokensAsync"/>) throw <see cref="NotImplementedException"/>
-/// pending a focused port of the Swift token signing pipeline:
-/// secp256k1 group operations for revocation commitments + FROST signing
-/// rounds + two-phase broadcast against the SOs. Each method is shaped to
-/// match the Swift API so consumers can write their code against the
-/// final signature today and only the implementation drops in later.
-/// </para>
-/// <para>
-/// Track the write-side port at
-/// <see href="https://github.com/p-i-g-g-y/nspark/issues" />.
-/// </para>
+/// Token transactions use the operators' V3 format by default, as the reference SDK does: one
+/// <c>broadcast_transaction</c> call, signed over the protohash of the partial transaction.
+/// <see cref="SparkOptions.TokenTransactionVersion"/> set to
+/// <see cref="TokenTransactionVersion.V2"/> keeps the older two-step flow while the operators
+/// accept it.
 /// </remarks>
 public static class TokenService
 {
     private const uint QueryTokenOutputsPageSize = 100;
+    private const int MaxTokenOutputsPerTx = 500;
+
+    /// <summary>Token identifiers per metadata query: the operators' <c>MaxTokenMetadataFilterValues</c>.</summary>
+    internal const int TokenMetadataBatchSize = 500;
+
+    /// <summary>
+    /// How long the operators may take to carry out a V3 token transaction: the reference SDK's
+    /// default (the operators accept 1 to 300 seconds).
+    /// </summary>
+    internal const ulong TokenValidityDurationSeconds = 180;
 
     /// <summary>
     /// Aggregate the wallet's token holdings into one <see cref="TokenBalance"/>
@@ -63,7 +62,7 @@ public static class TokenService
 
             byToken.TryGetValue(id, out var existing);
             existing.Owned += amount;
-            if (IsAvailableStatus(output))
+            if (TokenOutputLocks.IsAvailable(entry))
             {
                 existing.Available += amount;
             }
@@ -97,7 +96,7 @@ public static class TokenService
         ByteString[]? filter = null;
         if (bech32mTokenIdentifier is not null)
         {
-            var (raw, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Client.Options.Network);
+            var (raw, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Options.Network);
             filter = [ByteString.CopyFrom(raw)];
         }
 
@@ -117,16 +116,15 @@ public static class TokenService
     {
         ArgumentNullException.ThrowIfNull(wallet);
 
-        var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var client = wallet.Pool.GetTokenClient(soAddress);
-        var headers = await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false);
+        var client = wallet.GetTokenClient(wallet.CoordinatorAddress);
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
 
         var request = new QueryTokenMetadataRequest();
         if (bech32mTokenIdentifiers is not null)
         {
             foreach (var id in bech32mTokenIdentifiers)
             {
-                var (raw, _) = TokenIdentifier.Decode(id, wallet.Client.Options.Network);
+                var (raw, _) = TokenIdentifier.Decode(id, wallet.Options.Network);
                 request.TokenIdentifiers.Add(ByteString.CopyFrom(raw));
             }
         }
@@ -141,23 +139,31 @@ public static class TokenService
         var response = await client.query_token_metadataAsync(
             request, headers, cancellationToken: ct).ConfigureAwait(false);
 
-        return response.TokenMetadata.Select(m => ToModel(m, wallet.Client.Options.Network)).ToList();
+        return response.TokenMetadata.Select(m => ToModel(m, wallet.Options.Network)).ToList();
     }
 
     // ───────────────────────────────── Write-side ─────────────────────────────────
 
-    private const int MaxTokenOutputsPerTx = 500;
-
     /// <summary>
-    /// Transfer tokens to a receiver identified by their Spark address. Returns
-    /// the broadcast transaction hash (hex).
+    /// Transfer tokens to a receiver identified by their Spark address. Returns the transaction
+    /// hash (hex): the final transaction's protohash for V3, its V2 hash otherwise.
     /// </summary>
     /// <param name="wallet">The sending wallet.</param>
     /// <param name="bech32mTokenIdentifier">Bech32m token id (e.g. <c>"btkn1..."</c>).</param>
     /// <param name="amount">Token units to send.</param>
-    /// <param name="receiverSparkAddress">Receiver's Spark address (e.g. <c>"spark1..."</c>).</param>
+    /// <param name="receiverSparkAddress">
+    /// Receiver's Spark address (e.g. <c>"spark1..."</c>) for the wallet's network. A Spark invoice
+    /// is refused with <see cref="SparkConfigurationException"/>, as in <c>SendAsync</c>.
+    /// </param>
     /// <param name="strategy">Output-selection strategy.</param>
-    /// <param name="idempotencyKey">Optional idempotency token forwarded as gRPC metadata.</param>
+    /// <param name="idempotencyKey">
+    /// Makes retries safe. A retry with the same key, on the same wallet, resends the transaction
+    /// the first call built, so the transfer is made at most once: a retry after it went through
+    /// returns its hash again, and a retry after it failed completes it if it can still be sent,
+    /// else fails again. A key used for another token, amount or receiver is refused with
+    /// <see cref="ArgumentException"/>. The wallet remembers the last 1,000 keys; use a new key
+    /// for a new transfer.
+    /// </param>
     /// <param name="ct">Cancellation.</param>
     public static async Task<TokenTransferResult> TransferTokensAsync(
         this SparkWallet wallet,
@@ -172,37 +178,66 @@ public static class TokenService
         ArgumentException.ThrowIfNullOrEmpty(bech32mTokenIdentifier);
         ArgumentException.ThrowIfNullOrEmpty(receiverSparkAddress);
 
-        var (rawTokenId, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Client.Options.Network);
-        var outputs = await FetchTokenOutputsAsync(wallet, [ByteString.CopyFrom(rawTokenId)], ct).ConfigureAwait(false);
+        var (rawTokenId, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Options.Network);
+        // The receiver's identity key, from a Spark address for this network (a Spark invoice is
+        // refused), before any output is fetched.
+        var receiver = SparkAddress.Decode(receiverSparkAddress, wallet.Options.Network);
+        var request = new TokenTransferAttempts.Request(rawTokenId, amount, receiver);
+
+        TokenTransferAttempts.Attempt attempt;
+        if (idempotencyKey is not null && wallet.TokenTransferAttempts.Get(idempotencyKey) is { } earlier)
+        {
+            if (!earlier.Request.Matches(request))
+            {
+                throw new ArgumentException(
+                    $"Idempotency key {idempotencyKey} was used for a different token transfer.", nameof(idempotencyKey));
+            }
+
+            attempt = earlier;
+        }
+        else
+        {
+            attempt = await NewTokenTransferAsync(wallet, request, bech32mTokenIdentifier, strategy, ct).ConfigureAwait(false);
+            if (idempotencyKey is not null)
+            {
+                wallet.TokenTransferAttempts.Remember(attempt, idempotencyKey);
+            }
+        }
+
+        var (hash, _) = await SendTokenTransactionAsync(
+            wallet, attempt.Transaction, attempt.SpentOutputs, idempotencyKey, ct).ConfigureAwait(false);
+        return new TokenTransferResult(hash);
+    }
+
+    /// <summary>Picks outputs for <paramref name="request"/> and builds its transaction, with change back to the wallet.</summary>
+    private static async Task<TokenTransferAttempts.Attempt> NewTokenTransferAsync(
+        SparkWallet wallet,
+        TokenTransferAttempts.Request request,
+        string bech32mTokenIdentifier,
+        TokenSelectionStrategy strategy,
+        CancellationToken ct)
+    {
+        var outputs = await FetchTokenOutputsAsync(wallet, [ByteString.CopyFrom(request.TokenIdentifier)], ct).ConfigureAwait(false);
         if (outputs.Count == 0)
         {
             throw new SparkConfigurationException(
                 "token.transfer",
-                $"Insufficient token balance for {bech32mTokenIdentifier}: need {amount}, have 0.");
+                $"Insufficient token balance for {bech32mTokenIdentifier}: need {request.Amount}, have 0.");
         }
 
-        var selected = SelectTokenOutputs(outputs, amount, strategy);
-        var receiverPubKey = SparkAddress.DecodeIdentityPublicKey(receiverSparkAddress);
-
-        var tx = BuildTransferTokenTransaction(
-            wallet,
-            selected,
-            [(receiverPubKey, rawTokenId, amount)],
-            changeOwnerPubKey: wallet.IdentityPublicKey);
-
-        var (hashHex, _) = await BroadcastTokenTransactionV2Async(
-            wallet,
-            tx,
-            signingPublicKeys: selected.Select(o => o.Output.OwnerPublicKey.ToByteArray()).ToList(),
-            idempotencyKey,
-            ct).ConfigureAwait(false);
-
-        return new TokenTransferResult(hashHex);
+        // Only available outputs no other send from this wallet has picked (see TokenOutputLocks).
+        var selected = wallet.TokenOutputLocks.Acquire(outputs, spendable => SelectTokenOutputs(spendable, request.Amount, strategy));
+        var receiverOutput = new TokenOutputSpec(request.ReceiverIdentityPublicKey, request.TokenIdentifier, request.Amount);
+        var draft = TransferDraft(wallet, selected, TransferOutputs(selected, [receiverOutput], wallet.IdentityPublicKey));
+        return new TokenTransferAttempts.Attempt(request, draft, selected);
     }
 
     /// <summary>
     /// Create a new token on Spark — the caller's identity key becomes the issuer.
     /// </summary>
+    /// <remarks>
+    /// The parameters are checked as the operators check them (<see cref="ValidateTokenParameters"/>).
+    /// </remarks>
     public static async Task<TokenCreationResult> CreateTokenAsync(
         this SparkWallet wallet,
         string tokenName,
@@ -214,40 +249,13 @@ public static class TokenService
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(wallet);
-        ArgumentException.ThrowIfNullOrEmpty(tokenName);
-        ArgumentException.ThrowIfNullOrEmpty(tokenTicker);
+        ArgumentNullException.ThrowIfNull(tokenName);
+        ArgumentNullException.ThrowIfNull(tokenTicker);
+        ValidateTokenParameters(tokenName, tokenTicker, decimals, extraMetadata);
 
-        var nameBytes = System.Text.Encoding.UTF8.GetBytes(tokenName);
-        if (nameBytes.Length == 0 || nameBytes.Length > 20)
-        {
-            throw new SparkConfigurationException(
-                "token.create",
-                "Token name must be 1-20 UTF-8 bytes.");
-        }
-        var tickerBytes = System.Text.Encoding.UTF8.GetBytes(tokenTicker);
-        if (tickerBytes.Length == 0 || tickerBytes.Length > 6)
-        {
-            throw new SparkConfigurationException(
-                "token.create",
-                "Token ticker must be 1-6 UTF-8 bytes.");
-        }
-        if (decimals > 255)
-        {
-            throw new SparkConfigurationException(
-                "token.create",
-                "Decimals must be <= 255.");
-        }
-        if (extraMetadata is { Length: > 1024 })
-        {
-            throw new SparkConfigurationException(
-                "token.create",
-                "Extra metadata must be <= 1024 bytes.");
-        }
-
-        var issuerPubKey = wallet.IdentityPublicKey;
         var createInput = new TokenCreateInput
         {
-            IssuerPublicKey = ByteString.CopyFrom(issuerPubKey),
+            IssuerPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
             TokenName = tokenName,
             TokenTicker = tokenTicker,
             Decimals = decimals,
@@ -259,18 +267,58 @@ public static class TokenService
             createInput.ExtraMetadata = ByteString.CopyFrom(extraMetadata);
         }
 
-        var tx = NewTokenTransaction(wallet);
-        tx.CreateInput = createInput;
-
-        var (hashHex, tokenId) = await BroadcastTokenTransactionV2Async(
-            wallet, tx, signingPublicKeys: null, idempotencyKey: null, ct).ConfigureAwait(false);
+        var (hashHex, tokenId) = await SendTokenTransactionAsync(
+            wallet, Draft(wallet, DraftInputs.Create(createInput), []), [], idempotencyKey: null, ct).ConfigureAwait(false);
 
         string? bech32 = null;
         if (tokenId is { Length: 32 })
         {
-            bech32 = TokenIdentifier.Encode(tokenId, wallet.Client.Options.Network);
+            bech32 = TokenIdentifier.Encode(tokenId, wallet.Options.Network);
         }
         return new TokenCreationResult(hashHex, bech32);
+    }
+
+    /// <summary>
+    /// The operators' rules for a new token (<c>TokenMetadata.ValidatePartial</c>), also the
+    /// reference SDK's: the name 3–20 and the ticker 3–6 UTF-8 bytes, both in Unicode
+    /// normalization form C; decimals up to 255; extra metadata up to 1024 bytes. The operators
+    /// refuse a token that breaks them with INTERNAL, which reaches the wallet as "Something went
+    /// wrong.", so each rule is checked here to say which one.
+    /// </summary>
+    /// <exception cref="SparkConfigurationException">A rule is broken.</exception>
+    internal static void ValidateTokenParameters(string tokenName, string tokenTicker, uint decimals, byte[]? extraMetadata)
+    {
+        const string operation = "token.create";
+        if (!string.Equals(tokenName, tokenName.Normalize(NormalizationForm.FormC), StringComparison.Ordinal))
+        {
+            throw new SparkConfigurationException(operation, "Token name must be NFC-normalized UTF-8.");
+        }
+        if (!string.Equals(tokenTicker, tokenTicker.Normalize(NormalizationForm.FormC), StringComparison.Ordinal))
+        {
+            throw new SparkConfigurationException(operation, "Token ticker must be NFC-normalized UTF-8.");
+        }
+
+        var nameBytes = Encoding.UTF8.GetByteCount(tokenName);
+        if (nameBytes is < 3 or > 20)
+        {
+            throw new SparkConfigurationException(operation, $"Token name must be 3-20 UTF-8 bytes, not {nameBytes}.");
+        }
+
+        var tickerBytes = Encoding.UTF8.GetByteCount(tokenTicker);
+        if (tickerBytes is < 3 or > 6)
+        {
+            throw new SparkConfigurationException(operation, $"Token ticker must be 3-6 UTF-8 bytes, not {tickerBytes}.");
+        }
+
+        if (decimals > 255)
+        {
+            throw new SparkConfigurationException(operation, "Decimals must be <= 255.");
+        }
+
+        if (extraMetadata is { Length: > 1024 })
+        {
+            throw new SparkConfigurationException(operation, "Extra metadata must be <= 1024 bytes.");
+        }
     }
 
     /// <summary>
@@ -291,28 +339,16 @@ public static class TokenService
                 "Mint amount must be greater than 0.");
         }
 
-        var (rawTokenId, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Client.Options.Network);
-        var issuerPubKey = wallet.IdentityPublicKey;
-
+        var (rawTokenId, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Options.Network);
         var mintInput = new TokenMintInput
         {
-            IssuerPublicKey = ByteString.CopyFrom(issuerPubKey),
+            IssuerPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
             TokenIdentifier = ByteString.CopyFrom(rawTokenId),
         };
+        var output = new TokenOutputSpec(wallet.IdentityPublicKey, rawTokenId, amount);
 
-        var mintOutput = new TokenOutput
-        {
-            OwnerPublicKey = ByteString.CopyFrom(issuerPubKey),
-            TokenIdentifier = ByteString.CopyFrom(rawTokenId),
-            TokenAmount = EncodeUInt128(amount),
-        };
-
-        var tx = NewTokenTransaction(wallet);
-        tx.MintInput = mintInput;
-        tx.TokenOutputs.Add(mintOutput);
-
-        var (hashHex, _) = await BroadcastTokenTransactionV2Async(
-            wallet, tx, signingPublicKeys: null, idempotencyKey: null, ct).ConfigureAwait(false);
+        var (hashHex, _) = await SendTokenTransactionAsync(
+            wallet, Draft(wallet, DraftInputs.Mint(mintInput), [output]), [], idempotencyKey: null, ct).ConfigureAwait(false);
         return new TokenTransferResult(hashHex);
     }
 
@@ -333,7 +369,7 @@ public static class TokenService
         var burnPubKey = new byte[33];
         Array.Fill(burnPubKey, (byte)0x02);
 
-        var (rawTokenId, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Client.Options.Network);
+        var (rawTokenId, _) = TokenIdentifier.Decode(bech32mTokenIdentifier, wallet.Options.Network);
         var outputs = await FetchTokenOutputsAsync(wallet, [ByteString.CopyFrom(rawTokenId)], ct).ConfigureAwait(false);
         if (outputs.Count == 0)
         {
@@ -342,20 +378,11 @@ public static class TokenService
                 $"Insufficient token balance for {bech32mTokenIdentifier}: need {amount}, have 0.");
         }
 
-        var selected = SelectTokenOutputs(outputs, amount, strategy);
+        var selected = wallet.TokenOutputLocks.Acquire(outputs, spendable => SelectTokenOutputs(spendable, amount, strategy));
+        var burn = new TokenOutputSpec(burnPubKey, rawTokenId, amount);
+        var draft = TransferDraft(wallet, selected, TransferOutputs(selected, [burn], wallet.IdentityPublicKey));
 
-        var tx = BuildTransferTokenTransaction(
-            wallet,
-            selected,
-            [(burnPubKey, rawTokenId, amount)],
-            changeOwnerPubKey: wallet.IdentityPublicKey);
-
-        var (hashHex, _) = await BroadcastTokenTransactionV2Async(
-            wallet,
-            tx,
-            signingPublicKeys: selected.Select(o => o.Output.OwnerPublicKey.ToByteArray()).ToList(),
-            idempotencyKey: null,
-            ct).ConfigureAwait(false);
+        var (hashHex, _) = await SendTokenTransactionAsync(wallet, draft, selected, idempotencyKey: null, ct).ConfigureAwait(false);
         return new TokenTransferResult(hashHex);
     }
 
@@ -391,7 +418,7 @@ public static class TokenService
         var exact = outputs.FirstOrDefault(o => DecodeUInt128(o.Output.TokenAmount) == amount);
         if (exact is not null)
         {
-            return new List<OutputWithPreviousTransactionData> { exact };
+            return [exact];
         }
 
         if (strategy == TokenSelectionStrategy.SmallFirst)
@@ -477,97 +504,302 @@ public static class TokenService
         }
     }
 
-    // ───────────────────────────────── Build transfer tx ─────────────────────────────────
+    // ───────────────────────────────── Building ─────────────────────────────────
 
-    private static Proto.Token.TokenTransaction BuildTransferTokenTransaction(
-        SparkWallet wallet,
-        IReadOnlyList<OutputWithPreviousTransactionData> selectedOutputs,
-        IReadOnlyList<(byte[] ReceiverPubKey, byte[] RawTokenId, UInt128 Amount)> receiverOutputs,
-        byte[] changeOwnerPubKey)
+    /// <summary>An output a token transaction creates.</summary>
+    internal sealed record TokenOutputSpec(byte[] Owner, byte[] TokenIdentifier, UInt128 Amount);
+
+    /// <summary>
+    /// The outputs of a transfer spending <paramref name="spent"/> to <paramref name="receivers"/>:
+    /// the receivers' outputs, then change to <paramref name="changeOwner"/> for each token spent
+    /// beyond what they are paid.
+    /// </summary>
+    internal static List<TokenOutputSpec> TransferOutputs(
+        IReadOnlyList<OutputWithPreviousTransactionData> spent,
+        IReadOnlyList<TokenOutputSpec> receivers,
+        byte[] changeOwner)
     {
-        // Sort by previous-tx vout for deterministic ordering.
-        var sorted = selectedOutputs.OrderBy(o => o.PreviousTransactionVout).ToList();
-
-        // Sum per token-id available + requested for change calculation.
-        var availableByToken = new Dictionary<ByteString, UInt128>();
-        foreach (var output in sorted)
+        var change = new Dictionary<ByteString, UInt128>();
+        var order = new List<ByteString>();
+        foreach (var output in spent)
         {
-            var id = output.Output.TokenIdentifier;
-            availableByToken.TryGetValue(id, out var existing);
-            availableByToken[id] = existing + DecodeUInt128(output.Output.TokenAmount);
-        }
-        var requestedByToken = new Dictionary<ByteString, UInt128>();
-        foreach (var (_, rawTokenId, amount) in receiverOutputs)
-        {
-            var id = ByteString.CopyFrom(rawTokenId);
-            requestedByToken.TryGetValue(id, out var existing);
-            requestedByToken[id] = existing + amount;
-        }
-
-        var tokenOutputs = new List<TokenOutput>(receiverOutputs.Count + 1);
-        foreach (var (receiverPubKey, rawTokenId, amount) in receiverOutputs)
-        {
-            tokenOutputs.Add(new TokenOutput
+            var token = output.Output.TokenIdentifier;
+            if (!change.ContainsKey(token))
             {
-                OwnerPublicKey = ByteString.CopyFrom(receiverPubKey),
-                TokenIdentifier = ByteString.CopyFrom(rawTokenId),
-                TokenAmount = EncodeUInt128(amount),
-            });
+                order.Add(token);
+                change[token] = UInt128.Zero;
+            }
+            change[token] += DecodeUInt128(output.Output.TokenAmount);
         }
 
-        // Change outputs per token.
-        foreach (var (tokenId, availableAmount) in availableByToken)
+        foreach (var receiver in receivers)
         {
-            requestedByToken.TryGetValue(tokenId, out var requested);
-            if (availableAmount > requested)
+            var token = ByteString.CopyFrom(receiver.TokenIdentifier);
+            if (change.TryGetValue(token, out var available))
             {
-                tokenOutputs.Add(new TokenOutput
-                {
-                    OwnerPublicKey = ByteString.CopyFrom(changeOwnerPubKey),
-                    TokenIdentifier = tokenId,
-                    TokenAmount = EncodeUInt128(availableAmount - requested),
-                });
+                change[token] = available - UInt128.Min(available, receiver.Amount);
             }
         }
 
-        var transferInput = new TokenTransferInput();
-        foreach (var output in sorted)
+        var result = new List<TokenOutputSpec>(receivers);
+        foreach (var token in order)
         {
-            transferInput.OutputsToSpend.Add(new TokenOutputToSpend
+            if (change[token] > UInt128.Zero)
+            {
+                result.Add(new TokenOutputSpec(changeOwner, token.ToByteArray(), change[token]));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>A transfer spending <paramref name="spent"/>, in vout order, to <paramref name="outputs"/>.</summary>
+    internal static TokenTransactionDraft TransferDraft(
+        SparkWallet wallet,
+        IReadOnlyList<OutputWithPreviousTransactionData> spent,
+        IReadOnlyList<TokenOutputSpec> outputs)
+    {
+        var input = new TokenTransferInput();
+        foreach (var output in spent.OrderBy(o => o.PreviousTransactionVout))
+        {
+            input.OutputsToSpend.Add(new TokenOutputToSpend
             {
                 PrevTokenTransactionHash = output.PreviousTransactionHash,
                 PrevTokenTransactionVout = output.PreviousTransactionVout,
             });
         }
 
-        var tx = NewTokenTransaction(wallet);
-        tx.TransferInput = transferInput;
-        tx.TokenOutputs.AddRange(tokenOutputs);
-        return tx;
+        return Draft(wallet, DraftInputs.Transfer(input), outputs);
     }
 
-    // ───────────────────────────────── Two-phase broadcast ─────────────────────────────────
+    /// <summary>The inputs of a draft: exactly one of the three.</summary>
+    private sealed record DraftInputs(TokenTransferInput? TransferInput, TokenMintInput? MintInput, TokenCreateInput? CreateInput)
+    {
+        public static DraftInputs Transfer(TokenTransferInput input) => new(input, null, null);
 
+        public static DraftInputs Mint(TokenMintInput input) => new(null, input, null);
+
+        public static DraftInputs Create(TokenCreateInput input) => new(null, null, input);
+    }
+
+    private static TokenTransactionDraft Draft(SparkWallet wallet, DraftInputs inputs, IReadOnlyList<TokenOutputSpec> outputs)
+    {
+        var options = wallet.Options;
+        var operatorKeys = CollectOperatorIdentityPublicKeys(wallet);
+        switch (options.TokenTransactionVersion)
+        {
+            case TokenTransactionVersion.V2:
+            {
+                var tx = new TokenTransaction
+                {
+                    Version = 2,
+                    Network = options.ProtoNetwork(),
+                    ClientCreatedTimestamp = CurrentTimestamp(wallet),
+                };
+                if (inputs.TransferInput is not null)
+                {
+                    tx.TransferInput = inputs.TransferInput;
+                }
+                else if (inputs.MintInput is not null)
+                {
+                    tx.MintInput = inputs.MintInput;
+                }
+                else
+                {
+                    tx.CreateInput = inputs.CreateInput;
+                }
+
+                // The coordinator adds the withdraw bond and locktime to V2 outputs.
+                foreach (var spec in outputs)
+                {
+                    tx.TokenOutputs.Add(new TokenOutput
+                    {
+                        OwnerPublicKey = ByteString.CopyFrom(spec.Owner),
+                        TokenIdentifier = ByteString.CopyFrom(spec.TokenIdentifier),
+                        TokenAmount = EncodeUInt128(spec.Amount),
+                    });
+                }
+                tx.SparkOperatorIdentityPublicKeys.AddRange(operatorKeys.Select(ByteString.CopyFrom));
+                return new TokenTransactionDraft.V2(tx);
+            }
+            default:
+            {
+                var metadata = new TokenTransactionMetadata
+                {
+                    Network = options.ProtoNetwork(),
+                    ClientCreatedTimestamp = CurrentTimestamp(wallet),
+                    ValidityDurationSeconds = TokenValidityDurationSeconds,
+                };
+                // Strictly ascending, as the operators require of V3 transactions.
+                metadata.SparkOperatorIdentityPublicKeys.AddRange(operatorKeys.Select(ByteString.CopyFrom));
+
+                var partial = new PartialTokenTransaction
+                {
+                    Version = 3,
+                    TokenTransactionMetadata = metadata,
+                };
+                if (inputs.TransferInput is not null)
+                {
+                    partial.TransferInput = inputs.TransferInput;
+                }
+                else if (inputs.MintInput is not null)
+                {
+                    partial.MintInput = inputs.MintInput;
+                }
+                else
+                {
+                    partial.CreateInput = inputs.CreateInput;
+                }
+
+                // V3 outputs carry the withdraw bond and locktime, which must equal the network's.
+                foreach (var spec in outputs)
+                {
+                    partial.PartialTokenOutputs.Add(new PartialTokenOutput
+                    {
+                        OwnerPublicKey = ByteString.CopyFrom(spec.Owner),
+                        WithdrawBondSats = options.ExpectedWithdrawBondSats,
+                        WithdrawRelativeBlockLocktime = options.ExpectedWithdrawRelativeBlockLocktime,
+                        TokenIdentifier = ByteString.CopyFrom(spec.TokenIdentifier),
+                        TokenAmount = EncodeUInt128(spec.Amount),
+                    });
+                }
+
+                return new TokenTransactionDraft.V3(partial);
+            }
+        }
+    }
+
+    // ───────────────────────────────── Sending ─────────────────────────────────
+
+    /// <summary>
+    /// Sends <paramref name="draft"/>, signing for the <paramref name="spentOutputs"/> of a
+    /// transfer (or as the issuer of a mint or create), and returns the final transaction's hash
+    /// and, for a create, the token's identifier.
+    /// </summary>
+    private static async Task<(string TransactionHashHex, byte[]? TokenIdentifier)> SendTokenTransactionAsync(
+        SparkWallet wallet,
+        TokenTransactionDraft draft,
+        IReadOnlyList<OutputWithPreviousTransactionData> spentOutputs,
+        string? idempotencyKey,
+        CancellationToken ct)
+    {
+        var owners = spentOutputs
+            .OrderBy(o => o.PreviousTransactionVout)
+            .Select(o => o.Output.OwnerPublicKey.ToByteArray())
+            .ToList();
+        return draft switch
+        {
+            TokenTransactionDraft.V2 v2 => await BroadcastTokenTransactionV2Async(
+                wallet,
+                v2.Transaction,
+                v2.Transaction.TokenInputsCase == TokenTransaction.TokenInputsOneofCase.TransferInput ? owners : null,
+                idempotencyKey,
+                ct).ConfigureAwait(false),
+            TokenTransactionDraft.V3 v3 => await BroadcastTokenTransactionV3Async(wallet, v3.Partial, owners, idempotencyKey, ct).ConfigureAwait(false),
+            _ => throw new InvalidOperationException("Unknown token transaction draft."),
+        };
+    }
+
+    /// <summary>
+    /// V3: one <c>broadcast_transaction</c>, signed over the protohash of
+    /// <paramref name="partial"/>, which binds its inputs, outputs and amounts; the operators then
+    /// build, sign and commit the final transaction, which is checked to be
+    /// <paramref name="partial"/> before its hash is returned.
+    /// </summary>
+    private static async Task<(string TransactionHashHex, byte[]? TokenIdentifier)> BroadcastTokenTransactionV3Async(
+        SparkWallet wallet,
+        PartialTokenTransaction partial,
+        IReadOnlyList<byte[]> spentOutputOwners,
+        string? idempotencyKey,
+        CancellationToken ct)
+    {
+        var client = wallet.GetTokenClient(wallet.CoordinatorAddress);
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+        if (idempotencyKey is { Length: > 0 })
+        {
+            headers.Add(RenewalService.IdempotencyKeyHeader, idempotencyKey);
+        }
+
+        var request = new BroadcastTransactionRequest
+        {
+            IdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
+            PartialTokenTransaction = partial,
+        };
+        request.TokenTransactionOwnerSignatures.AddRange(
+            await OwnerSignaturesV3Async(wallet, partial, ProtoHash.Hash(partial), spentOutputOwners, ct).ConfigureAwait(false));
+
+        var response = await client.broadcast_transactionAsync(request, headers, cancellationToken: ct).ConfigureAwait(false);
+        var final = response.FinalTokenTransaction
+            ?? throw new SparkUntrustedResponseException("token.broadcast", "Missing final token transaction in the broadcast response.");
+        TokenTransactionValidator.ValidateV3(final, partial);
+
+        var hash = ProtoHash.Hash(final);
+        byte[]? tokenId = response.HasTokenIdentifier ? response.TokenIdentifier.ToByteArray() : null;
+        return (Convert.ToHexString(hash).ToLowerInvariant(), tokenId);
+    }
+
+    /// <summary>
+    /// One signature per input of a transfer, by the owner of the output it spends, or one by the
+    /// issuer for a mint or create; in <c>single_signature</c>, as the reference SDK sends them.
+    /// </summary>
+    private static async Task<List<SignatureWithIndex>> OwnerSignaturesV3Async(
+        SparkWallet wallet,
+        PartialTokenTransaction partial,
+        byte[] hash,
+        IReadOnlyList<byte[]> spentOutputOwners,
+        CancellationToken ct)
+    {
+        IReadOnlyList<byte[]> keys = partial.TokenInputsCase switch
+        {
+            PartialTokenTransaction.TokenInputsOneofCase.TransferInput
+                when spentOutputOwners.Count == partial.TransferInput.OutputsToSpend.Count => spentOutputOwners,
+            PartialTokenTransaction.TokenInputsOneofCase.TransferInput =>
+                throw new SparkConfigurationException("token.sign", "Missing signing keys for the outputs to spend."),
+            PartialTokenTransaction.TokenInputsOneofCase.MintInput
+                or PartialTokenTransaction.TokenInputsOneofCase.CreateInput => [wallet.IdentityPublicKey],
+            _ => throw new SparkConfigurationException("token.sign", "Token transaction has no inputs."),
+        };
+
+        var signatures = new List<SignatureWithIndex>(keys.Count);
+        for (var index = 0; index < keys.Count; index++)
+        {
+            var key = keys[index];
+            if (!key.AsSpan().SequenceEqual(wallet.IdentityPublicKey))
+            {
+                throw new SparkConfigurationException(
+                    "token.sign", $"Cannot sign with unknown key: {Convert.ToHexString(key).ToLowerInvariant()}.");
+            }
+
+            var signature = await wallet.Signer.SignWithIdentityKeyAsync(hash, ct).ConfigureAwait(false);
+            signatures.Add(new SignatureWithIndex
+            {
+                InputIndex = (uint)index,
+                SingleSignature = new KeyedSignature
+                {
+                    PublicKey = ByteString.CopyFrom(key),
+                    Signature = ByteString.CopyFrom(signature),
+                },
+            });
+        }
+
+        return signatures;
+    }
+
+    /// <summary>V2: <c>start_transaction</c>, checked, then <c>commit_transaction</c>.</summary>
     private static async Task<(string TransactionHashHex, byte[]? TokenIdentifier)>
         BroadcastTokenTransactionV2Async(
             SparkWallet wallet,
-            Proto.Token.TokenTransaction tx,
+            TokenTransaction tx,
             IReadOnlyList<byte[]>? signingPublicKeys,
             string? idempotencyKey,
             CancellationToken ct)
     {
-        var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var client = wallet.Pool.GetTokenClient(soAddress);
-        var headers = await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false);
-
+        var client = wallet.GetTokenClient(wallet.CoordinatorAddress);
+        var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+        var startHeaders = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
         if (idempotencyKey is { Length: > 0 })
         {
-            headers = new Grpc.Core.Metadata();
-            foreach (var entry in await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false))
-            {
-                headers.Add(entry);
-            }
-            headers.Add("x-idempotency-key", idempotencyKey);
+            startHeaders.Add(RenewalService.IdempotencyKeyHeader, idempotencyKey);
         }
 
         // Phase 1: sign the partial hash, send start_transaction.
@@ -583,19 +815,14 @@ public static class TokenService
         startRequest.PartialTokenTransactionOwnerSignatures.AddRange(ownerSignatures);
 
         var startResponse = await client.start_transactionAsync(
-            startRequest, headers, cancellationToken: ct).ConfigureAwait(false);
+            startRequest, startHeaders, cancellationToken: ct).ConfigureAwait(false);
 
-        if (startResponse.FinalTokenTransaction is null)
-        {
-            throw new SparkConfigurationException(
-                "token.broadcast",
-                "Missing final token transaction in start response.");
-        }
-        var finalTx = startResponse.FinalTokenTransaction;
+        var finalTx = startResponse.FinalTokenTransaction
+            ?? throw new SparkUntrustedResponseException("token.broadcast", "Missing final token transaction in the start response.");
 
         // The coordinator may only add server-set fields; anything else is refused before the
         // wallet signs the final hash for each operator (reference SDK: validateTokenTransaction).
-        var options = wallet.Client.Options;
+        var options = wallet.Options;
         TokenTransactionValidator.Validate(
             finalTx,
             tx,
@@ -626,11 +853,11 @@ public static class TokenService
         return (Convert.ToHexString(finalHash).ToLowerInvariant(), tokenId);
     }
 
-    // ───────────────────────────────── Owner / operator signatures ─────────────────────────────────
+    // ───────────────────────────────── Owner / operator signatures (V2) ─────────────────────────────────
 
     private static async Task<List<SignatureWithIndex>> BuildOwnerSignaturesAsync(
         SparkWallet wallet,
-        Proto.Token.TokenTransaction tx,
+        TokenTransaction tx,
         byte[] hash,
         IReadOnlyList<byte[]>? signingPublicKeys,
         CancellationToken ct)
@@ -639,8 +866,8 @@ public static class TokenService
 
         switch (tx.TokenInputsCase)
         {
-            case Proto.Token.TokenTransaction.TokenInputsOneofCase.MintInput:
-            case Proto.Token.TokenTransaction.TokenInputsOneofCase.CreateInput:
+            case TokenTransaction.TokenInputsOneofCase.MintInput:
+            case TokenTransaction.TokenInputsOneofCase.CreateInput:
                 {
                     var sig = await wallet.Signer.SignWithIdentityKeyAsync(hash, ct).ConfigureAwait(false);
                     signatures.Add(new SignatureWithIndex
@@ -650,7 +877,7 @@ public static class TokenService
                     });
                     break;
                 }
-            case Proto.Token.TokenTransaction.TokenInputsOneofCase.TransferInput:
+            case TokenTransaction.TokenInputsOneofCase.TransferInput:
                 {
                     if (signingPublicKeys is null)
                     {
@@ -685,7 +912,7 @@ public static class TokenService
 
     private static async Task<List<InputTtxoSignaturesPerOperator>> BuildOperatorSignaturesAsync(
         SparkWallet wallet,
-        Proto.Token.TokenTransaction tx,
+        TokenTransaction tx,
         byte[] finalHash,
         CancellationToken ct)
     {
@@ -697,8 +924,8 @@ public static class TokenService
 
             switch (tx.TokenInputsCase)
             {
-                case Proto.Token.TokenTransaction.TokenInputsOneofCase.MintInput:
-                case Proto.Token.TokenTransaction.TokenInputsOneofCase.CreateInput:
+                case TokenTransaction.TokenInputsOneofCase.MintInput:
+                case TokenTransaction.TokenInputsOneofCase.CreateInput:
                     {
                         var sig = await wallet.Signer.SignWithIdentityKeyAsync(payloadHash, ct).ConfigureAwait(false);
                         ttxoSignatures.Add(new SignatureWithIndex
@@ -708,7 +935,7 @@ public static class TokenService
                         });
                         break;
                     }
-                case Proto.Token.TokenTransaction.TokenInputsOneofCase.TransferInput:
+                case TokenTransaction.TokenInputsOneofCase.TransferInput:
                     {
                         var inputs = tx.TransferInput.OutputsToSpend;
                         for (int i = 0; i < inputs.Count; i++)
@@ -737,32 +964,16 @@ public static class TokenService
         return result;
     }
 
-    // ───────────────────────────────── Transaction skeleton ─────────────────────────────────
-
-    private static Proto.Token.TokenTransaction NewTokenTransaction(SparkWallet wallet)
-    {
-        var tx = new Proto.Token.TokenTransaction
-        {
-            Version = 2,
-            Network = ToProtoNetwork(wallet.Client.Options.Network),
-            ClientCreatedTimestamp = CurrentTimestamp(),
-        };
-        foreach (var op in CollectOperatorIdentityPublicKeys(wallet))
-        {
-            tx.SparkOperatorIdentityPublicKeys.Add(ByteString.CopyFrom(op));
-        }
-        return tx;
-    }
+    // ───────────────────────────────── Operator keys and time ─────────────────────────────────
 
     /// <summary>
     /// Operator identity public keys for the configured SOs, lexicographically
-    /// sorted. Empty hex / unparseable entries are skipped to keep behaviour
-    /// aligned with the Swift SDK on regtest where pubkeys may be unset.
+    /// sorted. Empty hex / unparseable entries are skipped.
     /// </summary>
     internal static IReadOnlyList<byte[]> CollectOperatorIdentityPublicKeys(SparkWallet wallet)
     {
         var keys = new List<byte[]>();
-        foreach (var op in wallet.Client.Options.SigningOperators)
+        foreach (var op in wallet.Options.SigningOperators)
         {
             if (string.IsNullOrEmpty(op.IdentityPublicKeyHex))
             {
@@ -781,33 +992,19 @@ public static class TokenService
                 // Skip unparseable hex.
             }
         }
-        keys.Sort(static (a, b) =>
-        {
-            var len = Math.Min(a.Length, b.Length);
-            for (int i = 0; i < len; i++)
-            {
-                var c = a[i].CompareTo(b[i]);
-                if (c != 0)
-                {
-                    return c;
-                }
-            }
-            return a.Length.CompareTo(b.Length);
-        });
+        keys.Sort(static (a, b) => a.AsSpan().SequenceCompareTo(b));
         return keys;
     }
 
-    private static Google.Protobuf.WellKnownTypes.Timestamp CurrentTimestamp()
+    /// <summary>
+    /// Now on the operators' clock, to the microsecond: they refuse a client timestamp outside the
+    /// transaction's validity window measured on theirs (the reference SDK stamps server time too).
+    /// </summary>
+    private static Google.Protobuf.WellKnownTypes.Timestamp CurrentTimestamp(SparkWallet wallet)
     {
-        // Match Swift behaviour: zero out sub-millisecond nanoseconds.
-        var now = DateTimeOffset.UtcNow;
-        var seconds = now.ToUnixTimeSeconds();
-        var milliFraction = (int)(now.ToUnixTimeMilliseconds() % 1000);
-        return new Google.Protobuf.WellKnownTypes.Timestamp
-        {
-            Seconds = seconds,
-            Nanos = milliFraction * 1_000_000,
-        };
+        var timestamp = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(wallet.Clock.ServerNow);
+        timestamp.Nanos = timestamp.Nanos / 1000 * 1000;
+        return timestamp;
     }
 
     // ───────────────────────────────── Internal helpers ─────────────────────────────────
@@ -817,16 +1014,14 @@ public static class TokenService
         IReadOnlyList<ByteString>? tokenIdentifiers,
         CancellationToken ct)
     {
-        var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var client = wallet.Pool.GetTokenClient(soAddress);
-        var headers = await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false);
-
-        var network = ToProtoNetwork(wallet.Client.Options.Network);
+        var client = wallet.GetTokenClient(wallet.CoordinatorAddress);
+        var network = wallet.Options.ProtoNetwork();
 
         var all = new List<OutputWithPreviousTransactionData>();
         string? cursor = null;
         do
         {
+            var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
             var request = new QueryTokenOutputsRequest
             {
                 Network = network,
@@ -860,34 +1055,36 @@ public static class TokenService
         return all;
     }
 
+    /// <summary>
+    /// Metadata of <paramref name="rawTokenIdentifiers"/>, asked for at most
+    /// <see cref="TokenMetadataBatchSize"/> at a time: the operators refuse larger filters, and
+    /// anyone can send a wallet tokens of as many kinds as they like.
+    /// </summary>
     private static async Task<Dictionary<ByteString, TokenMetadata>> FetchTokenMetadataMapAsync(
         SparkWallet wallet,
         IReadOnlyList<ByteString> rawTokenIdentifiers,
         CancellationToken ct)
     {
+        var result = new Dictionary<ByteString, TokenMetadata>(rawTokenIdentifiers.Count);
         if (rawTokenIdentifiers.Count == 0)
         {
-            return new Dictionary<ByteString, TokenMetadata>();
+            return result;
         }
 
-        var soAddress = wallet.Client.Options.SigningOperatorAddresses[0];
-        var client = wallet.Pool.GetTokenClient(soAddress);
-        var headers = await wallet.GetAuthMetadataAsync(soAddress, ct).ConfigureAwait(false);
-
-        var request = new QueryTokenMetadataRequest();
-        foreach (var id in rawTokenIdentifiers)
+        var client = wallet.GetTokenClient(wallet.CoordinatorAddress);
+        foreach (var batch in rawTokenIdentifiers.Chunk(TokenMetadataBatchSize))
         {
-            request.TokenIdentifiers.Add(id);
+            var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+            var request = new QueryTokenMetadataRequest();
+            request.TokenIdentifiers.AddRange(batch);
+            var response = await client.query_token_metadataAsync(
+                request, headers, cancellationToken: ct).ConfigureAwait(false);
+            foreach (var meta in response.TokenMetadata)
+            {
+                result[meta.TokenIdentifier] = ToModel(meta, wallet.Options.Network);
+            }
         }
 
-        var response = await client.query_token_metadataAsync(
-            request, headers, cancellationToken: ct).ConfigureAwait(false);
-
-        var result = new Dictionary<ByteString, TokenMetadata>(response.TokenMetadata.Count);
-        foreach (var meta in response.TokenMetadata)
-        {
-            result[meta.TokenIdentifier] = ToModel(meta, wallet.Client.Options.Network);
-        }
         return result;
     }
 
@@ -916,19 +1113,16 @@ public static class TokenService
             TokenAmount: DecodeUInt128(o.TokenAmount),
             PreviousTransactionHash: entry.PreviousTransactionHash.ToByteArray(),
             PreviousTransactionVout: entry.PreviousTransactionVout,
-            Status: o.HasStatus ? o.Status.ToString() : "AVAILABLE");
+            Status: o.HasStatus ? StatusName(o.Status) : "AVAILABLE");
     }
 
-    private static bool IsAvailableStatus(TokenOutput output) =>
-        !output.HasStatus
-        || output.Status == TokenOutputStatus.Unspecified
-        || output.Status == TokenOutputStatus.Available;
-
-    private static Network ToProtoNetwork(SparkNetwork network) => network switch
+    /// <summary>The operators' name of an output status, as <see cref="TokenOutputInfo.Status"/> documents it.</summary>
+    internal static string StatusName(TokenOutputStatus status) => status switch
     {
-        SparkNetwork.Mainnet => Network.Mainnet,
-        SparkNetwork.Regtest => Network.Regtest,
-        _ => throw new ArgumentOutOfRangeException(nameof(network)),
+        TokenOutputStatus.Available => "AVAILABLE",
+        TokenOutputStatus.PendingOutbound => "PENDING_OUTBOUND",
+        TokenOutputStatus.Unspecified => "UNSPECIFIED",
+        _ => ((int)status).ToString(System.Globalization.CultureInfo.InvariantCulture),
     };
 
     /// <summary>

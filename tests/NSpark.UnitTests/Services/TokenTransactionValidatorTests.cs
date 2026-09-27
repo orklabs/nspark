@@ -128,6 +128,22 @@ public sealed class TokenTransactionValidatorTests
     }
 
     [Test]
+    public void The_client_timestamp_is_compared_to_the_millisecond_the_hash_covers()
+    {
+        var partial = TransferPartial();
+        var movedMillisecond = Finalize(partial);
+        movedMillisecond.ClientCreatedTimestamp.Nanos += 1_000_000;
+        var removed = Finalize(partial);
+        removed.ClientCreatedTimestamp = null;
+        var subMillisecond = Finalize(partial);
+        subMillisecond.ClientCreatedTimestamp.Nanos += 999;
+
+        Validate(movedMillisecond, partial).Should().Throw<SparkUntrustedResponseException>().WithMessage("*timestamp changed*");
+        Validate(removed, partial).Should().Throw<SparkUntrustedResponseException>().WithMessage("*timestamp changed*");
+        Validate(subMillisecond, partial).Should().NotThrow("the transaction hash covers milliseconds only");
+    }
+
+    [Test]
     public void Rejects_a_keyshare_that_does_not_name_the_configured_operators()
     {
         var partial = TransferPartial();
