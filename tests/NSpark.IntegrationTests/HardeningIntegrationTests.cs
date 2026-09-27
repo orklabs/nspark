@@ -264,9 +264,10 @@ public class HardeningIntegrationTests
         var pair = await MakePairAsync(ct);
         RequireSpendable(pair, 6);
         await pair.Receiver.ClaimPendingTransfersAsync(ct);
+        // Sats of other in-flight operations (a cooperative exit waiting for its confirmations)
+        // may be locked already; the send must add none.
         var before = (await pair.Sender.GetBalanceAsync(ct)).SatsBalance;
         var receiverBefore = (await pair.Receiver.GetBalanceAsync(ct)).SatsBalance;
-        Assert.That(before.Locked, Is.Zero);
 
         var transfer = await pair.Sender.SendAsync(pair.Receiver.GetSparkAddress(), 1, ct);
         Assert.That(transfer.Status, Is.EqualTo(nameof(TransferStatus.SenderKeyTweaked)));
@@ -276,7 +277,7 @@ public class HardeningIntegrationTests
         var sent = (await pair.Sender.GetBalanceAsync(ct)).SatsBalance;
         TestContext.Out.WriteLine($"[{pair.SenderLabel}] owned {before.Owned} -> {sent.Owned}, locked {before.Locked} -> {sent.Locked}");
         Assert.That(sent.Owned, Is.EqualTo(before.Owned - 1));
-        Assert.That(sent.Locked, Is.Zero);
+        Assert.That(sent.Locked, Is.EqualTo(before.Locked));
         var receiverPending = (await pair.Receiver.GetBalanceAsync(ct)).SatsBalance;
         Assert.That(receiverPending.Incoming, Is.EqualTo(receiverBefore.Incoming + 1));
         Assert.That(receiverPending.Owned, Is.EqualTo(receiverBefore.Owned));
