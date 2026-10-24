@@ -65,6 +65,7 @@ internal sealed class FakeOperatorState
     private readonly List<string> _calls = [];
     private readonly List<(string Method, string? Timeout)> _timeouts = [];
     private readonly List<PreimageRequestWithTransfer> _heldSends = [];
+    private readonly List<QueryHtlcRequest> _htlcQueries = [];
     private readonly List<Transfer> _knownTransfers = [];
     private readonly List<TransferFilter> _transferFilters = [];
     private readonly List<Transfer> _pendingTransfers = [];
@@ -112,6 +113,9 @@ internal sealed class FakeOperatorState
     /// <summary>How a finalized broadcast answer is altered before it is sent.</summary>
     public Action<FinalTokenTransaction> Tamper { get; set; } = _ => { };
 
+    /// <summary>How a <c>query_htlc</c> answer is altered before it is sent, given the request.</summary>
+    public Action<QueryHtlcRequest, QueryHtlcResponse> TamperHtlc { get; set; } = (_, _) => { };
+
     /// <summary>What every <c>initiate_preimage_swap_v3</c> fails with.</summary>
     public Status PreimageSwapError { get; set; } = new(StatusCode.Internal, "preimage swap failed");
 
@@ -153,6 +157,9 @@ internal sealed class FakeOperatorState
 
     /// <summary>The <c>x-idempotency-key</c> of every <c>initiate_preimage_swap_v3</c>, in order.</summary>
     public IReadOnlyList<string> PreimageSwapIdempotencyKeys => Snapshot(_preimageSwapIdempotencyKeys);
+
+    /// <summary>Every <c>query_htlc</c> request, in order.</summary>
+    public IReadOnlyList<QueryHtlcRequest> HtlcQueries => Snapshot(_htlcQueries);
 
     /// <summary>The errors the next <c>verify_challenge</c> calls fail with, in order.</summary>
     public void FailNextVerifications(params Status[] errors)
@@ -204,7 +211,7 @@ internal sealed class FakeOperatorState
         }
     }
 
-    /// <summary>A Lightning send <c>query_htlc</c> reports as held, matched by transfer id.</summary>
+    /// <summary>A Lightning send <c>query_htlc</c> reports, matched by transfer id and payment hash.</summary>
     public void Hold(PreimageRequestWithTransfer send)
     {
         lock (_gate)
@@ -311,13 +318,31 @@ internal sealed class FakeOperatorState
         }
     }
 
-    internal IReadOnlyList<PreimageRequestWithTransfer> HeldSends(IEnumerable<string> transferIds)
+    /// <summary>
+    /// The held sends a <c>query_htlc</c> request matches, as the operators answer it: each filter
+    /// given applies (transfer ids, payment hashes), a page of <c>limit</c> from <c>offset</c>, and
+    /// the next offset only after a full page (-1 otherwise).
+    /// </summary>
+    internal QueryHtlcResponse QueryHtlc(QueryHtlcRequest query)
     {
-        var ids = transferIds.ToHashSet(StringComparer.Ordinal);
+        var ids = query.TransferIds.ToHashSet(StringComparer.Ordinal);
+        var hashes = query.PaymentHashes.Select(h => Convert.ToHexString(h.Span)).ToHashSet(StringComparer.Ordinal);
+        List<PreimageRequestWithTransfer> matches;
         lock (_gate)
         {
-            return _heldSends.Where(s => s.Transfer is not null && ids.Contains(s.Transfer.Id)).ToList();
+            _htlcQueries.Add(query.Clone());
+            matches = _heldSends
+                .Where(s => ids.Count == 0 || (s.Transfer is not null && ids.Contains(s.Transfer.Id)))
+                .Where(s => hashes.Count == 0 || hashes.Contains(Convert.ToHexString(s.PaymentHash.Span)))
+                .ToList();
         }
+
+        var limit = query.Limit is > 0 and < 100 ? (int)query.Limit : 100;
+        var page = matches.Skip((int)query.Offset).Take(limit).ToList();
+        var response = new QueryHtlcResponse { Offset = page.Count == limit ? query.Offset + limit : -1 };
+        response.PreimageRequests.AddRange(page.Select(s => s.Clone()));
+        TamperHtlc(query, response);
+        return response;
     }
 
     internal IReadOnlyList<Transfer> KnownTransfers(IEnumerable<string> transferIds)
@@ -578,12 +603,7 @@ internal sealed class FakeOperatorHandler : HttpMessageHandler
             case "generate_static_deposit_address":
                 return Ok(new GenerateStaticDepositAddressResponse { DepositAddress = _state.DepositAddress });
             case "query_htlc":
-            {
-                var query = QueryHtlcRequest.Parser.ParseFrom(payload);
-                var response = new QueryHtlcResponse { Offset = -1 };
-                response.PreimageRequests.AddRange(_state.HeldSends(query.TransferIds));
-                return Ok(response);
-            }
+                return Ok(_state.QueryHtlc(QueryHtlcRequest.Parser.ParseFrom(payload)));
 
             case "query_all_transfers":
                 _state.RecordTransferFilter(TransferFilter.Parser.ParseFrom(payload));

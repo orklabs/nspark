@@ -595,6 +595,56 @@ public class HardeningIntegrationTests
         Assert.That(after.Available, Is.EqualTo(before.Available));
     }
 
+    [Test]
+    public async Task Past_Lightning_sends_are_found_by_transfer_id_and_by_payment_hash()
+    {
+        using var cts = Timeout(TimeSpan.FromMinutes(3));
+        var ct = cts.Token;
+        var found = 0;
+        foreach (var (label, wallet) in new[] { ("A", _walletA), ("B", _walletB) })
+        {
+            var page = await wallet.GetTransfersAsync(100, direction: TransferDirection.Sent, ct: ct);
+            var lightning = page.Transfers.Where(t => t.Type == nameof(TransferType.PreimageSwap)).ToList();
+            if (lightning.Count == 0)
+            {
+                continue;
+            }
+
+            // Every preimage swap the wallet sent is a Lightning send the operators tie to its invoice.
+            var byId = await wallet.GetLightningSendsByTransferIdAsync(lightning.Select(t => t.Id), ct);
+            Assert.That(byId.Select(s => s.Transfer?.Id), Is.EquivalentTo(lightning.Select(t => t.Id)));
+            foreach (var send in byId)
+            {
+                var transfer = lightning.Single(t => t.Id == send.Transfer!.Id);
+                var context = $"[{label}] {transfer.Id}: transfer {transfer.Status}, HTLC {send.Status}";
+                Assert.That(send.Transfer!.TotalValueSats, Is.EqualTo(transfer.TotalValueSats), context);
+                Assert.That(send.IsPaid && send.IsReturned, Is.False, context);
+                if (transfer.Status == nameof(TransferStatus.Completed))
+                {
+                    Assert.That(send.IsPaid, Is.True, context);
+                }
+                if (transfer.Status is nameof(TransferStatus.Returned) or nameof(TransferStatus.Expired))
+                {
+                    Assert.That(send.IsReturned, Is.True, context);
+                }
+            }
+
+            // The same sends by their invoices' payment hashes.
+            var byHash = await wallet.GetLightningSendsByPaymentHashAsync(byId.Select(s => s.PaymentHash), ct);
+            Assert.That(byHash.Select(s => s.Transfer?.Id), Is.SupersetOf(byId.Select(s => s.Transfer?.Id)));
+            found += byId.Count;
+            TestContext.Out.WriteLine(
+                $"[{label}] {byId.Count} Lightning sends: {byId.Count(s => s.IsPaid)} paid " +
+                $"({byId.Count(s => s.Preimage is not null)} with the preimage), {byId.Count(s => s.IsReturned)} returned, " +
+                $"{byId.Count(s => !s.IsPaid && !s.IsReturned)} in flight");
+        }
+
+        if (found == 0)
+        {
+            Assert.Inconclusive("Neither test wallet has sent a Lightning payment yet.");
+        }
+    }
+
     [Test, Explicit(MovesSats)]
     public async Task An_invoice_pasted_in_upper_case_with_surrounding_whitespace_is_paid_as_validated()
     {

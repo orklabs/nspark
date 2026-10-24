@@ -110,6 +110,40 @@ that transfer; it answers a repeated request for a transfer with the request
 it already has, so a send that went through returns its request id instead
 of paying twice.
 
+## Finding a send by its invoice
+
+`GetLightningSendsByPaymentHashAsync` asks the operators which sends this
+wallet made for one or more invoices, by payment hash and in any state (the
+reference SDK's `queryHTLC` as the sender). It needs no SSP request id, so it
+answers "did this invoice go out?" even when nothing was recorded: after a
+crash or a lost response mid-send, or for a send another process made.
+
+```csharp
+var sends = await wallet.GetLightningSendsByPaymentHashAsync([paymentHash], ct);
+if (sends.Any(s => s.IsPaid))
+{
+    // Paid. The preimage is the proof; the transfer's total is the amount plus the fee.
+}
+else if (sends.Any(s => !s.IsReturned))
+{
+    // In flight: the SSP may still pay. The leaves come back by Transfer.ExpiresAt at the latest.
+}
+else
+{
+    // Never sent, or every attempt came back: nothing left the wallet.
+}
+```
+
+Each entry is the wallet's HTLC to the SSP for that invoice with the transfer
+funding it: `IsPaid` once the SSP shared the preimage (it only learns it by
+paying; NSpark checks it hashes to the payment hash) or claimed the transfer,
+`IsReturned` once the transfer was returned or expired. An invoice the wallet
+never sent to has no entry; one sent again after a returned attempt has one
+entry per attempt. Sends older than the operators' record of who sent an HTLC
+are not found. `GetLightningSendsByTransferIdAsync` looks sends up by
+transfer id instead, for instance to tell which invoice a preimage-swap
+transfer from `GetTransfersAsync` paid.
+
 ## Estimating routing fees before paying
 
 ```csharp
@@ -164,7 +198,8 @@ try
 catch (Exception ex)
 {
     // Was the payment actually submitted? Check by payment hash before retrying.
-    await ledger.RecordPaymentError(req, ex);
+    var sends = await wallet.GetLightningSendsByPaymentHashAsync([paymentHash], ct);
+    await ledger.RecordPaymentError(req, ex, submitted: sends.Any(s => !s.IsReturned));
     throw;
 }
 ```

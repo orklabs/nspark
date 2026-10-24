@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using Google.Protobuf;
 using Grpc.Core;
 using NSpark.Exceptions;
@@ -16,6 +17,13 @@ public static class LightningService
 {
     private const string InvoiceOperation = "lightning.invoice";
     private const string PayOperation = "lightning.pay";
+    private const string SendsOperation = "lightning.sends";
+
+    /// <summary>The operators' <c>query_htlc</c> limits: filter values per request, HTLCs per page.</summary>
+    private const int HtlcFilterLimit = 1000, HtlcPageSize = 100;
+
+    /// <summary>Pages per request after which a coordinator that keeps answering is not believed.</summary>
+    private const int MaxHtlcPages = 1000;
 
     /// <summary>Longest memo, in UTF-8 bytes, a BOLT-11 description can carry.</summary>
     private const int MaxMemoBytes = 639;
@@ -223,12 +231,190 @@ public static class LightningService
             : null;
 
         // The SSP's payment-hash field doesn't appear on LightningSendRequest, so we don't have it
-        // here. Callers that need it must keep the (request_id ↔ payment_hash) mapping themselves.
+        // here. Callers that need it must keep the (request_id ↔ payment_hash) mapping themselves,
+        // or look the send up by payment hash (GetLightningSendsByPaymentHashAsync).
         return new LightningSendStatus(
             PaymentHash: string.Empty,
             Status: data.SendStatus,
             FeeSats: feeSats,
             Preimage: data.SendPaymentPreimage);
+    }
+
+    /// <summary>
+    /// The Lightning payments this wallet sent for the invoices with these payment hashes, as the
+    /// Signing Operators hold them, in any state: the reference SDK's <c>queryHTLC</c> as the
+    /// sender. It needs no SSP request id, so it also finds a send whose request id was never
+    /// recorded (a crash or a lost response mid-send, another process), and tells whether an
+    /// invoice was paid at all: one this wallet never sent to has no entry.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="LightningSend.IsPaid"/> and <see cref="LightningSend.IsReturned"/> tell paid,
+    /// returned and in-flight sends apart; the transfer's total is the invoice amount plus the fee
+    /// paid. An invoice sent to again after a returned attempt has an entry per attempt. Sends
+    /// older than the operators' record of who sent an HTLC are not found.
+    /// </para>
+    /// <para>
+    /// Every entry must be this wallet's preimage swap for an invoice asked about, and a preimage
+    /// must hash to its payment hash; otherwise the call throws
+    /// <see cref="SparkUntrustedResponseException"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="wallet">The wallet that sent the payments.</param>
+    /// <param name="paymentHashes">The invoices' payment hashes, hex (64 characters each).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <exception cref="ArgumentException">A payment hash is not 64 hex characters.</exception>
+    public static async Task<IReadOnlyList<LightningSend>> GetLightningSendsByPaymentHashAsync(
+        this SparkWallet wallet,
+        IEnumerable<string> paymentHashes,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(wallet);
+        ArgumentNullException.ThrowIfNull(paymentHashes);
+        var hashes = new List<string>();
+        foreach (var hash in paymentHashes)
+        {
+            if (hash is not { Length: 64 } || !hash.All(char.IsAsciiHexDigit))
+            {
+                throw new ArgumentException($"A payment hash must be 64 hex characters, got '{hash}'.", nameof(paymentHashes));
+            }
+            hashes.Add(hash.ToLowerInvariant());
+        }
+
+        return await wallet.QueryLightningSendsAsync([.. hashes.Distinct(StringComparer.Ordinal)], byPaymentHash: true, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The Lightning sends this wallet made under these transfer ids, as the Signing Operators hold
+    /// them, in any state: the ids given to <see cref="PayLightningInvoiceAsync"/>, or of the
+    /// wallet's preimage-swap transfers (<see cref="TransferService.GetTransfersAsync"/>), to tell
+    /// which invoice each one paid. An id that is not a Lightning send of this wallet has no entry.
+    /// Answers are checked as by <see cref="GetLightningSendsByPaymentHashAsync"/>.
+    /// </summary>
+    /// <param name="wallet">The wallet that sent the payments.</param>
+    /// <param name="transferIds">The sends' transfer ids (UUIDs).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <exception cref="ArgumentException">A transfer id is not a UUID.</exception>
+    public static async Task<IReadOnlyList<LightningSend>> GetLightningSendsByTransferIdAsync(
+        this SparkWallet wallet,
+        IEnumerable<string> transferIds,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(wallet);
+        ArgumentNullException.ThrowIfNull(transferIds);
+        var ids = new List<string>();
+        foreach (var id in transferIds)
+        {
+            if (!Guid.TryParse(id, out var guid))
+            {
+                throw new ArgumentException($"A transfer id must be a UUID, got '{id}'.", nameof(transferIds));
+            }
+            ids.Add(guid.ToString("D"));
+        }
+
+        return await wallet.QueryLightningSendsAsync([.. ids.Distinct(StringComparer.Ordinal)], byPaymentHash: false, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <c>query_htlc</c> as the sender for these payment hashes or transfer ids (normalized), in
+    /// requests of at most 1,000 values, following each request's pages to the end.
+    /// </summary>
+    private static async Task<IReadOnlyList<LightningSend>> QueryLightningSendsAsync(
+        this SparkWallet wallet, IReadOnlyList<string> values, bool byPaymentHash, CancellationToken ct)
+    {
+        var sends = new List<LightningSend>();
+        if (values.Count == 0)
+        {
+            return sends;
+        }
+
+        var client = wallet.GetCoordinatorClient();
+        foreach (var chunk in values.Chunk(HtlcFilterLimit))
+        {
+            var asked = chunk.ToHashSet(StringComparer.Ordinal);
+            long offset = 0;
+            for (var page = 0; offset >= 0; page++)
+            {
+                if (page == MaxHtlcPages)
+                {
+                    throw new SparkUntrustedResponseException(SendsOperation, $"query_htlc returned more than {MaxHtlcPages} pages.");
+                }
+
+                var request = new QueryHtlcRequest
+                {
+                    IdentityPublicKey = ByteString.CopyFrom(wallet.IdentityPublicKey),
+                    MatchRole = PreimageRequestRole.Sender,
+                    Limit = HtlcPageSize,
+                    Offset = offset,
+                };
+                if (byPaymentHash)
+                {
+                    request.PaymentHashes.AddRange(chunk.Select(hash => ByteString.CopyFrom(Convert.FromHexString(hash))));
+                }
+                else
+                {
+                    request.TransferIds.AddRange(chunk);
+                }
+
+                var headers = await wallet.GetCoordinatorAuthMetadataAsync(ct).ConfigureAwait(false);
+                var response = await client.query_htlcAsync(request, headers, cancellationToken: ct).ConfigureAwait(false);
+                foreach (var htlc in response.PreimageRequests)
+                {
+                    var send = ToLightningSend(htlc, wallet.IdentityPublicKey);
+                    var key = byPaymentHash ? send.PaymentHash : send.Transfer?.Id.ToLowerInvariant();
+                    if (key is null || !asked.Contains(key))
+                    {
+                        throw new SparkUntrustedResponseException(SendsOperation, "query_htlc returned a send that was not asked for.");
+                    }
+                    sends.Add(send);
+                }
+
+                if (response.Offset >= 0 && response.Offset <= offset)
+                {
+                    throw new SparkUntrustedResponseException(SendsOperation, $"query_htlc returned offset {response.Offset} after offset {offset}.");
+                }
+                offset = response.Offset;
+            }
+        }
+
+        return sends;
+    }
+
+    /// <summary>
+    /// A send <c>query_htlc</c> reported, checked: a 32-byte payment hash, this wallet's HTLC and
+    /// preimage-swap transfer, and a preimage, if any, that hashes to the payment hash.
+    /// </summary>
+    internal static LightningSend ToLightningSend(PreimageRequestWithTransfer htlc, byte[] identityPublicKey)
+    {
+        if (htlc.PaymentHash.Length != 32)
+        {
+            throw new SparkUntrustedResponseException(SendsOperation, "query_htlc returned an HTLC without a 32-byte payment hash.");
+        }
+        if (!htlc.SenderIdentityPubkey.Span.SequenceEqual(identityPublicKey)
+            || htlc.Transfer is { } transfer
+                && (transfer.Type != TransferType.PreimageSwap || !transfer.SenderIdentityPublicKey.Span.SequenceEqual(identityPublicKey)))
+        {
+            throw new SparkUntrustedResponseException(SendsOperation, "query_htlc returned an HTLC that is not a Lightning send of this wallet.");
+        }
+
+        string? preimage = null;
+        if (!htlc.Preimage.IsEmpty)
+        {
+            if (!SHA256.HashData(htlc.Preimage.Span).AsSpan().SequenceEqual(htlc.PaymentHash.Span))
+            {
+                throw new SparkUntrustedResponseException(SendsOperation, "query_htlc returned a preimage that does not hash to its payment hash.");
+            }
+            preimage = Convert.ToHexString(htlc.Preimage.Span).ToLowerInvariant();
+        }
+
+        return new LightningSend(
+            PaymentHash: Convert.ToHexString(htlc.PaymentHash.Span).ToLowerInvariant(),
+            Status: htlc.Status.ToString(),
+            Preimage: preimage,
+            CreatedAt: htlc.CreatedTime?.ToDateTimeOffset() ?? DateTimeOffset.UnixEpoch,
+            Transfer: htlc.Transfer is null ? null : TransferMapping.ToModel(htlc.Transfer));
     }
 
     /// <summary>

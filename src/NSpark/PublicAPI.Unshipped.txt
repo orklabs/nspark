@@ -163,6 +163,23 @@ NSpark.Models.LightningInvoice.PaymentRequest.get -> string!
 NSpark.Models.LightningInvoice.PaymentRequest.init -> void
 NSpark.Models.LightningInvoice.RequestId.get -> string?
 NSpark.Models.LightningInvoice.RequestId.init -> void
+NSpark.Models.LightningSend
+NSpark.Models.LightningSend.<Clone>$() -> NSpark.Models.LightningSend!
+NSpark.Models.LightningSend.CreatedAt.get -> System.DateTimeOffset
+NSpark.Models.LightningSend.CreatedAt.init -> void
+NSpark.Models.LightningSend.Deconstruct(out string! PaymentHash, out string! Status, out string? Preimage, out System.DateTimeOffset CreatedAt, out NSpark.Models.SparkTransfer? Transfer) -> void
+NSpark.Models.LightningSend.Equals(NSpark.Models.LightningSend? other) -> bool
+NSpark.Models.LightningSend.IsPaid.get -> bool
+NSpark.Models.LightningSend.IsReturned.get -> bool
+NSpark.Models.LightningSend.LightningSend(string! PaymentHash, string! Status, string? Preimage, System.DateTimeOffset CreatedAt, NSpark.Models.SparkTransfer? Transfer) -> void
+NSpark.Models.LightningSend.PaymentHash.get -> string!
+NSpark.Models.LightningSend.PaymentHash.init -> void
+NSpark.Models.LightningSend.Preimage.get -> string?
+NSpark.Models.LightningSend.Preimage.init -> void
+NSpark.Models.LightningSend.Status.get -> string!
+NSpark.Models.LightningSend.Status.init -> void
+NSpark.Models.LightningSend.Transfer.get -> NSpark.Models.SparkTransfer?
+NSpark.Models.LightningSend.Transfer.init -> void
 NSpark.Models.LightningSendStatus
 NSpark.Models.LightningSendStatus.<Clone>$() -> NSpark.Models.LightningSendStatus!
 NSpark.Models.LightningSendStatus.Deconstruct(out string! PaymentHash, out string! Status, out long? FeeSats, out string? Preimage) -> void
@@ -313,6 +330,8 @@ NSpark.Models.SparkTransfer.CreatedAt.get -> System.DateTimeOffset
 NSpark.Models.SparkTransfer.CreatedAt.init -> void
 NSpark.Models.SparkTransfer.Deconstruct(out string! Id, out string! SenderIdentityPublicKey, out string! ReceiverIdentityPublicKey, out long TotalValueSats, out string! Status, out System.DateTimeOffset CreatedAt, out string? Type) -> void
 NSpark.Models.SparkTransfer.Equals(NSpark.Models.SparkTransfer? other) -> bool
+NSpark.Models.SparkTransfer.ExpiresAt.get -> System.DateTimeOffset?
+NSpark.Models.SparkTransfer.ExpiresAt.init -> void
 NSpark.Models.SparkTransfer.Id.get -> string!
 NSpark.Models.SparkTransfer.Id.init -> void
 NSpark.Models.SparkTransfer.ReceiverIdentityPublicKey.get -> string!
@@ -805,6 +824,9 @@ override NSpark.Models.FeeQuote.ToString() -> string!
 override NSpark.Models.LightningInvoice.Equals(object? obj) -> bool
 override NSpark.Models.LightningInvoice.GetHashCode() -> int
 override NSpark.Models.LightningInvoice.ToString() -> string!
+override NSpark.Models.LightningSend.Equals(object? obj) -> bool
+override NSpark.Models.LightningSend.GetHashCode() -> int
+override NSpark.Models.LightningSend.ToString() -> string!
 override NSpark.Models.LightningSendStatus.Equals(object? obj) -> bool
 override NSpark.Models.LightningSendStatus.GetHashCode() -> int
 override NSpark.Models.LightningSendStatus.ToString() -> string!
@@ -959,6 +981,8 @@ static NSpark.Models.FeeQuote.operator !=(NSpark.Models.FeeQuote? left, NSpark.M
 static NSpark.Models.FeeQuote.operator ==(NSpark.Models.FeeQuote? left, NSpark.Models.FeeQuote? right) -> bool
 static NSpark.Models.LightningInvoice.operator !=(NSpark.Models.LightningInvoice? left, NSpark.Models.LightningInvoice? right) -> bool
 static NSpark.Models.LightningInvoice.operator ==(NSpark.Models.LightningInvoice? left, NSpark.Models.LightningInvoice? right) -> bool
+static NSpark.Models.LightningSend.operator !=(NSpark.Models.LightningSend? left, NSpark.Models.LightningSend? right) -> bool
+static NSpark.Models.LightningSend.operator ==(NSpark.Models.LightningSend? left, NSpark.Models.LightningSend? right) -> bool
 static NSpark.Models.LightningSendStatus.operator !=(NSpark.Models.LightningSendStatus? left, NSpark.Models.LightningSendStatus? right) -> bool
 static NSpark.Models.LightningSendStatus.operator ==(NSpark.Models.LightningSendStatus? left, NSpark.Models.LightningSendStatus? right) -> bool
 static NSpark.Models.PendingTransferClaim.operator !=(NSpark.Models.PendingTransferClaim? left, NSpark.Models.PendingTransferClaim? right) -> bool
@@ -1041,6 +1065,8 @@ static NSpark.Services.LightningService.CreateLightningInvoiceAsync(this NSpark.
 static NSpark.Services.LightningService.GetLightningReceiveRequestStatusAsync(this NSpark.SparkWallet! wallet, string! requestId, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string?>!
 static NSpark.Services.LightningService.GetLightningSendFeeEstimateAsync(this NSpark.SparkWallet! wallet, string! encodedInvoice, long? amountSats = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<long>!
 static NSpark.Services.LightningService.GetLightningSendStatusAsync(this NSpark.SparkWallet! wallet, string! requestId, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.LightningSendStatus?>!
+static NSpark.Services.LightningService.GetLightningSendsByPaymentHashAsync(this NSpark.SparkWallet! wallet, System.Collections.Generic.IEnumerable<string!>! paymentHashes, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.LightningSend!>!>!
+static NSpark.Services.LightningService.GetLightningSendsByTransferIdAsync(this NSpark.SparkWallet! wallet, System.Collections.Generic.IEnumerable<string!>! transferIds, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<NSpark.Models.LightningSend!>!>!
 static NSpark.Services.LightningService.PayLightningInvoiceAsync(this NSpark.SparkWallet! wallet, string! paymentRequest, long maxFeeSats, long? amountSats = null, string? transferId = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
 static NSpark.Services.PrivacyService.GetWalletSettingsAsync(this NSpark.SparkWallet! wallet, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.WalletSettings!>!
 static NSpark.Services.PrivacyService.SetPrivacyEnabledAsync(this NSpark.SparkWallet! wallet, bool enabled, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<NSpark.Models.WalletSettings!>!

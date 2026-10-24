@@ -21,4 +21,10 @@ public sealed record SparkTransfer(
 {
     /// <summary>The Spark invoice this transfer pays, if any.</summary>
     public string? SparkInvoice { get; init; }
+
+    /// <summary>
+    /// When the operators give the transfer back to its sender if it is still unclaimed: a held
+    /// Lightning send's leaves return by then. Null when the operators report none.
+    /// </summary>
+    public DateTimeOffset? ExpiresAt { get; init; }
 }

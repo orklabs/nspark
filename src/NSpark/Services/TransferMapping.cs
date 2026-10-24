@@ -28,6 +28,7 @@ internal static class TransferMapping
         Type: transfer.Type.ToString())
     {
         SparkInvoice = string.IsNullOrEmpty(transfer.SparkInvoice) ? null : transfer.SparkInvoice,
+        ExpiresAt = transfer.ExpiryTime is { Seconds: > 0 } expiry ? expiry.ToDateTimeOffset() : null,
     };
 }
 

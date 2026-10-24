@@ -10,6 +10,20 @@ will be reflected here.
 
 ## [Unreleased]
 
+### Added
+- **Lightning sends can be looked up by invoice.** `GetLightningSendsByPaymentHashAsync`
+  returns what the operators hold for each payment hash, in any state: the wallet's HTLC to the
+  SSP and the transfer funding it (the reference SDK's `queryHTLC` as the sender). It needs no
+  SSP request id, so a send whose request id was never recorded — a crash or a lost response
+  mid-send, another process — can still be found and settled or released; NSpark only used this
+  lookup internally, by transfer id, to resume a held send. `LightningSend.IsPaid` (the SSP shared
+  the preimage or claimed the transfer) and `IsReturned` (the transfer came back) tell paid,
+  returned and in-flight sends apart; the transfer's total is the amount plus the fee paid.
+  `GetLightningSendsByTransferIdAsync` looks sends up by transfer id. Answers are checked: only
+  this wallet's preimage swaps for the invoices or ids asked about, and a preimage must hash to
+  its payment hash, or `SparkUntrustedResponseException`.
+- `SparkTransfer.ExpiresAt`: when the operators give an unclaimed transfer back to its sender.
+
 ## [0.3.0-alpha.1] - 2026-09-27
 
 Brings NSpark to the level of the Swift SDK 0.3.0 (`spark-swift-sdk`, 2026-09-27): parity
