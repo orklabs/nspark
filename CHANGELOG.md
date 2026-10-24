@@ -10,6 +10,8 @@ will be reflected here.
 
 ## [Unreleased]
 
+## [0.3.0-alpha.2] - 2026-10-24
+
 ### Added
 - **Lightning sends can be looked up by invoice.** `GetLightningSendsByPaymentHashAsync`
   returns what the operators hold for each payment hash, in any state: the wallet's HTLC to the
@@ -735,7 +737,8 @@ the wallet plugs into the gRPC request.
 - See [docs/trust-model.md](docs/trust-model.md) for the documented threat
   model and the default Signing Operator / SSP trust assumptions.
 
-[Unreleased]: https://github.com/orklabs/nspark/compare/v0.3.0-alpha.1...HEAD
+[Unreleased]: https://github.com/orklabs/nspark/compare/v0.3.0-alpha.2...HEAD
+[0.3.0-alpha.2]: https://github.com/orklabs/nspark/releases/tag/v0.3.0-alpha.2
 [0.3.0-alpha.1]: https://github.com/orklabs/nspark/releases/tag/v0.3.0-alpha.1
 [0.2.0-alpha.4]: https://github.com/orklabs/nspark/releases/tag/v0.2.0-alpha.4
 [0.2.0-alpha.3]: https://github.com/orklabs/nspark/releases/tag/v0.2.0-alpha.3
